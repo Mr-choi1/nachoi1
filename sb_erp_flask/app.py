@@ -26,6 +26,47 @@ def call_potens_ai(prompt):
     return response.json().get('message', '')
 
 
+# ---------- 오타 보정 (레벤슈타인 유사도) ----------
+# 각 카테고리 키워드 목록 자체가 유사어 사전 역할을 하고,
+# 여기에 오타까지 허용하기 위해 단어 단위 유사도 매칭을 함께 사용한다.
+def calculate_similarity(a, b):
+    len1, len2 = len(a), len(b)
+    if len1 == 0 or len2 == 0:
+        return 1.0 if len1 == len2 else 0.0
+
+    matrix = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+    for i in range(len1 + 1):
+        matrix[i][0] = i
+    for j in range(len2 + 1):
+        matrix[0][j] = j
+
+    for i in range(1, len1 + 1):
+        for j in range(1, len2 + 1):
+            if a[i - 1] == b[j - 1]:
+                matrix[i][j] = matrix[i - 1][j - 1]
+            else:
+                matrix[i][j] = min(
+                    matrix[i - 1][j - 1] + 1,
+                    matrix[i][j - 1] + 1,
+                    matrix[i - 1][j] + 1
+                )
+
+    distance = matrix[len1][len2]
+    return 1 - distance / max(len1, len2)
+
+
+def contains_keyword(query, keywords):
+    for keyword in keywords:
+        if keyword in query:
+            return True
+        for word in query.split():
+            # 한글 2음절 키워드는 오타 한 글자만 나도 유사도가 0.5까지 떨어지므로
+            # 기준을 0.5로 낮춰서 실사용 오타(메출→매출 등)를 잡는다.
+            if len(word) >= 2 and calculate_similarity(word, keyword) >= 0.5:
+                return True
+    return False
+
+
 # ---------- 웹 앱 실행 ----------
 @app.route('/')
 def index():
@@ -43,28 +84,28 @@ def process_ai_query(user_query):
     query = user_query.lower()
 
     period = extract_period(query)
-    is_comparison = any(k in query for k in ['비교', '차이', '대비'])
+    is_comparison = contains_keyword(query, ['비교', '차이', '대비'])
     specific_item = extract_specific_item(query)
     stats_type = extract_stats_type(query)
-    is_cause_analysis = any(k in query for k in ['원인', '이유', '왜'])
+    is_cause_analysis = contains_keyword(query, ['원인', '이유', '왜'])
 
-    if any(k in query for k in ['재무', '매출', '수익', '손익', '이익']):
-        return handle_financial_query(query, period, is_comparison, specific_item, stats_type)
+    result = None
 
-    if any(k in query for k in ['생산', '제품', '생산량', '공장']):
-        return handle_production_query(query, period, is_comparison, specific_item, stats_type)
+    if contains_keyword(query, ['재무', '매출', '수익', '손익', '이익']):
+        result = handle_financial_query(query, period, is_comparison, specific_item, stats_type)
+    elif contains_keyword(query, ['생산', '제품', '생산량', '공장']):
+        result = handle_production_query(query, period, is_comparison, specific_item, stats_type)
+    elif contains_keyword(query, ['구매', '발주', '자재', '공급']):
+        result = handle_purchase_query(query, period, is_comparison, specific_item, stats_type)
+    elif contains_keyword(query, ['품질', '불량', '검사', '합격']):
+        result = handle_quality_query(query, period, is_comparison, specific_item, stats_type, is_cause_analysis)
+    elif contains_keyword(query, ['인사', '직원', '사원', '근태', '부서']):
+        result = handle_hr_query(query, period, is_comparison, specific_item, stats_type)
+    elif contains_keyword(query, ['전체', '모든', '종합']):
+        result = handle_comprehensive_query(query)
 
-    if any(k in query for k in ['구매', '발주', '자재', '공급']):
-        return handle_purchase_query(query, period, is_comparison, specific_item, stats_type)
-
-    if any(k in query for k in ['품질', '불량', '검사', '합격']):
-        return handle_quality_query(query, period, is_comparison, specific_item, stats_type, is_cause_analysis)
-
-    if any(k in query for k in ['인사', '직원', '사원', '근태', '부서']):
-        return handle_hr_query(query, period, is_comparison, specific_item, stats_type)
-
-    if any(k in query for k in ['전체', '모든', '종합']):
-        return handle_comprehensive_query(query)
+    if result:
+        return enrich_structured_response(result)
 
     # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 포텐스닷 LLM에게 위임
     try:
@@ -80,11 +121,21 @@ def process_ai_query(user_query):
     except Exception as e:
         print(f'Potens AI 호출 실패: {e}')
 
+    suggestions = get_suggestions(query)
+    suggestion_text = ''
+    if suggestions:
+        suggestion_text = (
+            '혹시 이런 질문을 하신 건가요?\n' +
+            '\n'.join(f'- "{s}"' for s in suggestions) +
+            '\n\n'
+        )
+
     return {
         'type': 'text',
         'data': None,
         'message': (
-            '질문을 더 구체적으로 해주시면 정확한 데이터를 찾아드리겠습니다.\n\n'
+            '질문을 더 구체적으로 해주시면 정확한 데이터를 찾아드리겠습니다.\n\n' +
+            suggestion_text +
             '💡 질문 예시:\n'
             '- "3월과 4월 매출 비교해줘"\n'
             '- "4월 생산량 알려줘"\n'
@@ -95,14 +146,61 @@ def process_ai_query(user_query):
     }
 
 
+# ---------- 질문 추천 ----------
+def get_suggestions(query):
+    templates = [
+        '3월과 4월 매출 비교해줘',
+        '4월 생산량 알려줘',
+        '불량의 주요 원인은?',
+        '생산부 출근율 보여줘',
+        'A-100 모델 생산 현황',
+        '이번 달 구매 발주 현황 알려줘',
+        '부서별 인원 현황 보여줘',
+        '전체 경영 현황 요약해줘'
+    ]
+
+    words = [w for w in query.split() if len(w) >= 2]
+    suggestions = []
+
+    for template in templates:
+        if any(w in template for w in words):
+            suggestions.append(template)
+        if len(suggestions) >= 3:
+            break
+
+    return suggestions
+
+
+# ---------- 응답별 신뢰도 표시 + 관련 메뉴 안내 ----------
+MENU_GUIDE = {
+    'financial': '재무관리 > 손익현황',
+    'production': '생산관리 > 생산실적',
+    'purchase': '구매관리 > 발주현황',
+    'quality': '품질관리 > 검사현황',
+    'quality_cause': '품질관리 > 불량원인분석',
+    'hr': '인사관리 > 근태/부서현황',
+    'comprehensive': '경영현황판 > 전체 요약'
+}
+
+
+def enrich_structured_response(result):
+    footer = '✅ 사내 DB 기반 확정 데이터입니다.'
+    menu = MENU_GUIDE.get(result.get('type'))
+    if menu:
+        footer += f'\n📁 관련 메뉴: {menu}'
+
+    result['message'] = f"{result['message']}\n\n{footer}"
+    return result
+
+
 # ---------- 기간 추출 ----------
 def extract_period(query):
     months = ['1월', '2월', '3월', '4월', '5월', '6월', '7월', '8월', '9월', '10월', '11월', '12월']
     found_months = [m for m in months if m in query]
 
-    if any(k in query for k in ['최근', '이번주', '이번달']):
+    if contains_keyword(query, ['최근', '이번주', '이번달']):
         return {'type': 'recent', 'value': None}
-    if any(k in query for k in ['지난', '전']):
+    if contains_keyword(query, ['지난', '전']):
         return {'type': 'past', 'value': None}
     if found_months:
         return {'type': 'specific', 'value': found_months}
@@ -146,19 +244,19 @@ def extract_specific_item(query):
 
 # ---------- 통계 유형 추출 ----------
 def extract_stats_type(query):
-    if '평균' in query:
+    if contains_keyword(query, ['평균']):
         return 'average'
-    if any(k in query for k in ['최대', '가장 높', '제일 높', '가장 많']):
+    if contains_keyword(query, ['최대', '가장 높', '제일 높', '가장 많']):
         return 'max'
-    if any(k in query for k in ['최소', '가장 낮', '제일 낮', '가장 적']):
+    if contains_keyword(query, ['최소', '가장 낮', '제일 낮', '가장 적']):
         return 'min'
-    if any(k in query for k in ['합계', '총']):
+    if contains_keyword(query, ['합계', '총']):
         return 'sum'
-    if any(k in query for k in ['증가', '상승']):
+    if contains_keyword(query, ['증가', '상승']):
         return 'increase'
-    if any(k in query for k in ['감소', '하락']):
+    if contains_keyword(query, ['감소', '하락']):
         return 'decrease'
-    if any(k in query for k in ['추세', '트렌드']):
+    if contains_keyword(query, ['추세', '트렌드']):
         return 'trend'
 
     return None
