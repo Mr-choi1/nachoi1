@@ -298,19 +298,22 @@
         <div class="logo-icon">SB</div>
         <span>SB선보</span>
       </div>
-      <div style="color: #666; font-size: 14px;">ERP Management System</div>
+      <div style="display: flex; align-items: center; gap: 16px;">
+        <div style="color: #666; font-size: 14px;">{{ department }} · {{ username }}님</div>
+        <a href="{{ url_for('logout') }}" style="color: #1e3c72; font-size: 14px; font-weight: bold; text-decoration: none;">로그아웃</a>
+      </div>
     </div>
 
     <!-- 메인 타이틀 -->
     <div class="main-title">안녕하세요! 무엇을 도와드릴까요?</div>
 
-    <!-- 카테고리 버튼 -->
+    <!-- 카테고리 버튼 (소속 부서 권한에 맞는 항목만 표시) -->
     <div class="category-buttons">
-      <button class="category-btn" onclick="loadCategory('financial')">💰 재무</button>
-      <button class="category-btn" onclick="loadCategory('production')">🏭 생산</button>
-      <button class="category-btn" onclick="loadCategory('purchase')">🛒 구매</button>
-      <button class="category-btn" onclick="loadCategory('quality')">✅ 품질</button>
-      <button class="category-btn" onclick="loadCategory('hr')">👥 인사</button>
+      {% if 'financial' in allowed_categories %}<button class="category-btn" onclick="loadCategory('financial')">💰 재무</button>{% endif %}
+      {% if 'production' in allowed_categories %}<button class="category-btn" onclick="loadCategory('production')">🏭 생산</button>{% endif %}
+      {% if 'purchase' in allowed_categories %}<button class="category-btn" onclick="loadCategory('purchase')">🛒 구매</button>{% endif %}
+      {% if 'quality' in allowed_categories %}<button class="category-btn" onclick="loadCategory('quality')">✅ 품질</button>{% endif %}
+      {% if 'hr' in allowed_categories %}<button class="category-btn" onclick="loadCategory('hr')">👥 인사</button>{% endif %}
     </div>
 
     <!-- 챗봇 영역 -->

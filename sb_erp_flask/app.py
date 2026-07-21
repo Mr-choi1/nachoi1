@@ -1,9 +1,113 @@
 import copy
 import os
+import sqlite3
+from functools import wraps
+
 import requests
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+# 운영 배포 시 반드시 SECRET_KEY 환경변수로 교체할 것 (세션 쿠키 서명에 사용됨)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# ---------- 사용자 DB (SQLite) ----------
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
+
+# 부서별로 조회 가능한 데이터 카테고리 (RBAC). role이 admin이면 전체 조회 가능.
+DEPARTMENT_CATEGORY_ACCESS = {
+    '관리부': {'financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr', 'comprehensive'},
+    '영업부': {'financial', 'purchase', 'comprehensive'},
+    '생산부': {'production', 'quality', 'quality_cause', 'comprehensive'},
+    '품질부': {'quality', 'quality_cause', 'production', 'comprehensive'},
+    '기술부': {'production', 'purchase', 'comprehensive'},
+}
+
+ALL_CATEGORIES = {'financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr', 'comprehensive'}
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            department TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'staff'
+        )
+    ''')
+    conn.commit()
+
+    existing = conn.execute('SELECT COUNT(*) AS cnt FROM users').fetchone()['cnt']
+    if existing == 0:
+        # 최초 실행 시에만 데모 계정 시드. 운영 전 반드시 비밀번호 변경 필요.
+        seed_users = [
+            ('admin', 'admin1234', '관리부', 'admin'),
+            ('sales1', 'sales1234', '영업부', 'staff'),
+            ('prod1', 'prod1234', '생산부', 'staff'),
+            ('qc1', 'qc1234', '품질부', 'staff'),
+            ('tech1', 'tech1234', '기술부', 'staff'),
+        ]
+        for username, pw, dept, role in seed_users:
+            conn.execute(
+                'INSERT INTO users (username, password_hash, department, role) VALUES (?, ?, ?, ?)',
+                (username, generate_password_hash(pw), dept, role)
+            )
+        conn.commit()
+    conn.close()
+
+
+def get_allowed_categories(department, role):
+    if role == 'admin':
+        return set(ALL_CATEGORIES)
+    return set(DEPARTMENT_CATEGORY_ACCESS.get(department, set()))
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if 'user_id' not in session:
+            if request.path.startswith('/api/'):
+                return jsonify({'error': '로그인이 필요합니다.'}), 401
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        conn = get_db()
+        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+        conn.close()
+
+        if user and check_password_hash(user['password_hash'], password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['department'] = user['department']
+            session['role'] = user['role']
+            return redirect(url_for('index'))
+
+        error = '아이디 또는 비밀번호가 올바르지 않습니다.'
+
+    return render_template('login.html', error=error)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 # ---------- 포텐스닷(potens.ai) LLM 연동 ----------
 # 키는 코드에 직접 넣지 말고 환경변수 POTENS_API_KEY 로 설정합니다.
@@ -69,18 +173,27 @@ def contains_keyword(query, keywords):
 
 # ---------- 웹 앱 실행 ----------
 @app.route('/')
+@login_required
 def index():
-    return render_template('index.html')
+    allowed = get_allowed_categories(session['department'], session['role'])
+    return render_template(
+        'index.html',
+        username=session['username'],
+        department=session['department'],
+        allowed_categories=allowed
+    )
 
 
 # ---------- AI 챗봇 응답 처리 ----------
 @app.route('/api/query', methods=['POST'])
+@login_required
 def process_ai_query_route():
     user_query = request.json.get('query', '')
-    return jsonify(process_ai_query(user_query))
+    allowed = get_allowed_categories(session['department'], session['role'])
+    return jsonify(process_ai_query(user_query, allowed))
 
 
-def process_ai_query(user_query):
+def process_ai_query(user_query, allowed_categories=None):
     query = user_query.lower()
 
     period = extract_period(query)
@@ -105,6 +218,12 @@ def process_ai_query(user_query):
         result = handle_comprehensive_query(query)
 
     if result:
+        if allowed_categories is not None and result.get('type') not in allowed_categories:
+            return {
+                'type': 'text',
+                'data': None,
+                'message': '🔒 소속 부서 권한으로는 조회할 수 없는 데이터입니다. 담당 부서 또는 관리자에게 문의해주세요.'
+            }
         return enrich_structured_response(result)
 
     # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 포텐스닷 LLM에게 위임
@@ -852,7 +971,15 @@ def get_hr_data():
 
 # ---------- 카테고리별 데이터 조회 ----------
 @app.route('/api/category/<category>', methods=['GET'])
+@login_required
 def get_category_data_route(category):
+    allowed = get_allowed_categories(session['department'], session['role'])
+    if category not in allowed:
+        return jsonify({
+            'type': 'text',
+            'data': None,
+            'message': '🔒 소속 부서 권한으로는 조회할 수 없는 데이터입니다. 담당 부서 또는 관리자에게 문의해주세요.'
+        })
     return jsonify(get_category_data(category))
 
 
@@ -870,6 +997,7 @@ def get_category_data(category):
     return {'type': 'text', 'data': None, 'message': '데이터를 찾을 수 없습니다.'}
 
 
+init_db()
+
 if __name__ == '__main__':
-    import os
     app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
