@@ -197,13 +197,35 @@
       to { opacity: 1; transform: translateY(0); }
     }
 
+    .result-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 3px solid #1e3c72;
+    }
+
     .result-title {
       font-size: 24px;
       font-weight: bold;
       color: #1e3c72;
-      margin-bottom: 20px;
-      padding-bottom: 10px;
-      border-bottom: 3px solid #1e3c72;
+    }
+
+    .export-btn {
+      padding: 8px 16px;
+      background: #1e3c72;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .export-btn:hover {
+      background: #2a5298;
     }
 
     /* 테이블 스타일 */
@@ -298,7 +320,11 @@
         <div class="logo-icon">SB</div>
         <span>SB선보</span>
       </div>
-      <div style="display: flex; align-items: center; gap: 16px;">
+      <div style="display: flex; align-items: center; gap: 16px; position: relative;">
+        <div style="position: relative; cursor: pointer;" id="notifBell" onclick="toggleNotifications()">
+          🔔<span id="notifBadge" style="display:none; position:absolute; top:-6px; right:-10px; background:#e74c3c; color:white; font-size:11px; font-weight:bold; border-radius:10px; padding:1px 6px;">0</span>
+          <div id="notifPanel" style="display:none; position:absolute; top:28px; right:0; width:320px; max-height:360px; overflow-y:auto; background:white; border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.2); z-index:10; text-align:left;"></div>
+        </div>
         <div style="color: #666; font-size: 14px;">{{ department }} · {{ username }}님</div>
         <a href="{{ url_for('logout') }}" style="color: #1e3c72; font-size: 14px; font-weight: bold; text-decoration: none;">로그아웃</a>
       </div>
@@ -337,13 +363,94 @@
 
     <!-- 결과 표시 영역 -->
     <div class="result-container" id="resultContainer">
-      <div class="result-title" id="resultTitle"></div>
+      <div class="result-header">
+        <div class="result-title" id="resultTitle"></div>
+        <button class="export-btn" onclick="exportCSV()">⬇ CSV 내보내기</button>
+      </div>
       <div id="resultContent"></div>
     </div>
   </div>
 
   <script>
     let currentChart = null; // 차트 인스턴스 저장
+    let lastResponse = null; // CSV 내보내기용 마지막 응답 저장
+
+    // CSV 내보내기
+    function exportCSV() {
+      if (!lastResponse) return;
+
+      fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: lastResponse.type, data: lastResponse.data })
+      })
+        .then(res => {
+          if (!res.ok) throw new Error('export failed');
+          return res.blob();
+        })
+        .then(blob => {
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `erp_export_${lastResponse.type}.csv`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+        })
+        .catch(() => alert('내보내기에 실패했습니다. 표 형태의 데이터만 내보낼 수 있습니다.'));
+    }
+
+    // 알림 목록 불러오기
+    function fetchNotifications() {
+      fetch('/api/notifications')
+        .then(res => res.json())
+        .then(data => renderNotifications(data.notifications || []))
+        .catch(() => {});
+    }
+
+    function renderNotifications(items) {
+      const badge = document.getElementById('notifBadge');
+      const panel = document.getElementById('notifPanel');
+      const unread = items.filter(n => !n.is_read);
+
+      if (unread.length > 0) {
+        badge.style.display = 'inline-block';
+        badge.textContent = unread.length;
+      } else {
+        badge.style.display = 'none';
+      }
+
+      if (items.length === 0) {
+        panel.innerHTML = '<div style="padding:16px; color:#999; font-size:13px;">알림이 없습니다.</div>';
+        return;
+      }
+
+      panel.innerHTML = items.map(n => `
+        <div onclick="markNotificationRead(${n.id}, event)"
+             style="padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:13px; cursor:pointer; background:${n.is_read ? 'white' : '#eef4ff'};">
+          <div style="color:#333; line-height:1.5;">${n.message}</div>
+          <div style="color:#999; font-size:11px; margin-top:4px;">${n.department} · ${n.created_at}</div>
+        </div>
+      `).join('');
+    }
+
+    function toggleNotifications() {
+      const panel = document.getElementById('notifPanel');
+      const isOpen = panel.style.display === 'block';
+      panel.style.display = isOpen ? 'none' : 'block';
+      if (!isOpen) fetchNotifications();
+    }
+
+    function markNotificationRead(id, event) {
+      event.stopPropagation();
+      fetch(`/api/notifications/${id}/read`, { method: 'POST' })
+        .then(() => fetchNotifications());
+    }
+
+    // 최초 로드 및 60초 주기로 알림 갱신
+    fetchNotifications();
+    setInterval(fetchNotifications, 60000);
 
     // 엔터키 처리
     function handleKeyPress(event) {
@@ -423,6 +530,7 @@
 
       // 결과 표시
       if (response.data) {
+        lastResponse = response;
         displayResult(response);
       }
     }

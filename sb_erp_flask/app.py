@@ -1,10 +1,14 @@
 import copy
+import csv
+import io
 import os
+import re
 import sqlite3
+from collections import Counter
 from functools import wraps
 
 import requests
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
@@ -25,6 +29,9 @@ DEPARTMENT_CATEGORY_ACCESS = {
 
 ALL_CATEGORIES = {'financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr', 'comprehensive'}
 
+# 특정 불량 유형이 전체 불량의 이 비율(%)을 넘으면 관련 부서에 알림 발송
+QUALITY_ALERT_THRESHOLD = 35
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -41,6 +48,15 @@ def init_db():
             password_hash TEXT NOT NULL,
             department TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'staff'
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            department TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            is_read INTEGER NOT NULL DEFAULT 0
         )
     ''')
     conn.commit()
@@ -68,6 +84,45 @@ def get_allowed_categories(department, role):
     if role == 'admin':
         return set(ALL_CATEGORIES)
     return set(DEPARTMENT_CATEGORY_ACCESS.get(department, set()))
+
+
+# ---------- 임계치 알림 ----------
+def create_notification(department, message):
+    conn = get_db()
+    conn.execute(
+        'INSERT INTO notifications (department, message) VALUES (?, ?)',
+        (department, message)
+    )
+    conn.commit()
+    conn.close()
+
+
+def notify_if_new(department, message):
+    # 같은 경고가 미확인 상태로 이미 있으면 중복 알림을 만들지 않는다.
+    conn = get_db()
+    existing = conn.execute(
+        'SELECT id FROM notifications WHERE department = ? AND message = ? AND is_read = 0',
+        (department, message)
+    ).fetchone()
+    conn.close()
+    if not existing:
+        create_notification(department, message)
+
+
+def get_notifications(department, role, unread_only=False):
+    conn = get_db()
+    if role == 'admin':
+        query = 'SELECT * FROM notifications'
+        params = ()
+    else:
+        query = 'SELECT * FROM notifications WHERE department = ?'
+        params = (department,)
+    if unread_only:
+        query += (' AND' if 'WHERE' in query else ' WHERE') + ' is_read = 0'
+    query += ' ORDER BY created_at DESC LIMIT 50'
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def login_required(f):
@@ -130,6 +185,55 @@ def call_potens_ai(prompt):
     return response.json().get('message', '')
 
 
+# ---------- RAG: 사내 문서 검색 ----------
+# 벡터DB 없이 키워드 겹침 기반의 경량 검색으로, knowledge/ 폴더의 문서 중
+# 질문과 가장 관련 있는 문서를 찾아 LLM 프롬프트에 근거로 첨부한다.
+KNOWLEDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'knowledge')
+
+
+def load_knowledge_documents():
+    docs = []
+    if not os.path.isdir(KNOWLEDGE_DIR):
+        return docs
+    for fname in sorted(os.listdir(KNOWLEDGE_DIR)):
+        if fname.endswith('.md') or fname.endswith('.txt'):
+            path = os.path.join(KNOWLEDGE_DIR, fname)
+            with open(path, encoding='utf-8') as f:
+                docs.append({'title': fname.rsplit('.', 1)[0], 'content': f.read()})
+    return docs
+
+
+def char_bigrams(text):
+    # 한글은 조사(는/은/가/을 등)가 단어에 바로 붙기 때문에 단어 단위 매칭은
+    # "휴가는"과 "휴가"를 다른 단어로 취급해 놓치기 쉽다. 음절 2-gram(바이그램)
+    # 기반으로 비교하면 조사가 붙어도 어간 부분이 겹쳐서 매칭된다.
+    cleaned = re.sub(r'[^가-힣a-zA-Z0-9]', '', text.lower())
+    return Counter(cleaned[i:i + 2] for i in range(len(cleaned) - 1))
+
+
+def search_knowledge(query, top_k=2):
+    query_grams = char_bigrams(query)
+    total = sum(query_grams.values())
+    if total == 0:
+        return []
+
+    scored = []
+    for doc in load_knowledge_documents():
+        doc_grams = char_bigrams(doc['title'] + doc['content'])
+        overlap = sum((query_grams & doc_grams).values())
+        if overlap:
+            scored.append((overlap / total, doc))
+
+    scored = [(score, doc) for score, doc in scored if score >= 0.15]
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_score = scored[0][0]
+    # 1등과 점수 차이가 큰(우연히 겹친) 문서는 노이즈이므로 함께 반환하지 않는다.
+    return [doc for score, doc in scored[:top_k] if score >= top_score * 0.5]
+
+
 # ---------- 오타 보정 (레벤슈타인 유사도) ----------
 # 각 카테고리 키워드 목록 자체가 유사어 사전 역할을 하고,
 # 여기에 오타까지 허용하기 위해 단어 단위 유사도 매칭을 함께 사용한다.
@@ -159,15 +263,35 @@ def calculate_similarity(a, b):
     return 1 - distance / max(len1, len2)
 
 
+# 2음절 키워드는 글자 하나만 달라도 유사도가 0.5까지 떨어져서, 느슨한 기준을
+# 쓰면 "인사"~"검사"처럼 전혀 다른 단어까지 오매칭된다. 그래서 2음절 키워드는
+# 실사용에서 자주 보이는 오타만 사전에 등록해 명시적으로 허용하고, 4음절
+# 이상의 긴 단어에 한해서만 레벤슈타인 유사도 매칭을 함께 사용한다.
+TYPO_VARIANTS = {
+    '매출': ['메출', '매촐', '매춀'],
+    '생산': ['셍산', '생상', '셍상'],
+    '불량': ['불냥', '불럥'],
+    '직원': ['즉원'],
+    '재무': ['재부', '제무'],
+    '구매': ['구메'],
+    '품질': ['품칠', '풍질'],
+    '인사': ['인싸'],
+    '부서': ['부셔'],
+    '근태': ['근테'],
+}
+
+
 def contains_keyword(query, keywords):
     for keyword in keywords:
         if keyword in query:
             return True
-        for word in query.split():
-            # 한글 2음절 키워드는 오타 한 글자만 나도 유사도가 0.5까지 떨어지므로
-            # 기준을 0.5로 낮춰서 실사용 오타(메출→매출 등)를 잡는다.
-            if len(word) >= 2 and calculate_similarity(word, keyword) >= 0.5:
+        for variant in TYPO_VARIANTS.get(keyword, []):
+            if variant in query:
                 return True
+        if len(keyword) >= 4:
+            for word in query.split():
+                if len(word) >= 4 and calculate_similarity(word, keyword) >= 0.75:
+                    return True
     return False
 
 
@@ -190,15 +314,20 @@ def index():
 def process_ai_query_route():
     user_query = request.json.get('query', '')
     allowed = get_allowed_categories(session['department'], session['role'])
-    return jsonify(process_ai_query(user_query, allowed))
+    return jsonify(process_ai_query(user_query, allowed, session['department']))
 
 
-def process_ai_query(user_query, allowed_categories=None):
+def process_ai_query(user_query, allowed_categories=None, department=None):
     query = user_query.lower()
 
     period = extract_period(query)
     is_comparison = contains_keyword(query, ['비교', '차이', '대비'])
     specific_item = extract_specific_item(query)
+
+    # 조직도 연동: "우리 부서/우리팀" 질문은 로그인한 사용자의 소속 부서로 자동 인식
+    if specific_item is None and department and contains_keyword(query, ['우리 부서', '우리부서', '우리팀', '우리 팀', '저희 부서', '저희팀']):
+        specific_item = department
+
     stats_type = extract_stats_type(query)
     is_cause_analysis = contains_keyword(query, ['원인', '이유', '왜'])
 
@@ -226,8 +355,29 @@ def process_ai_query(user_query, allowed_categories=None):
             }
         return enrich_structured_response(result)
 
-    # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 포텐스닷 LLM에게 위임
+    # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 사내 문서(RAG) 검색 후 포텐스닷 LLM에게 위임
+    knowledge_hits = search_knowledge(user_query)
     try:
+        if knowledge_hits:
+            context_text = '\n\n'.join(
+                f"[{doc['title']}]\n{doc['content']}" for doc in knowledge_hits
+            )
+            prompt = (
+                '다음은 사내 규정/매뉴얼 문서입니다. 이 내용을 근거로 사용자 질문에 답변하세요. '
+                '문서에 없는 내용은 추측하지 말고 모른다고 답하세요.\n\n'
+                f'{context_text}\n\n사용자 질문: {user_query}'
+            )
+            ai_answer = call_potens_ai(prompt)
+            sources = ', '.join(doc['title'] for doc in knowledge_hits)
+            return {
+                'type': 'text',
+                'data': None,
+                'message': (
+                    f'📚 {ai_answer}\n\n'
+                    f'※ 참고 문서: {sources}'
+                )
+            }
+
         ai_answer = call_potens_ai(user_query)
         return {
             'type': 'text',
@@ -611,6 +761,16 @@ def handle_quality_query(query, period, is_comparison, specific_item, stats_type
 
         message += f"📊 주요 불량 유형: {max_defect['type']} ({max_defect['count']}건, {max_defect['rate']}%)\n\n"
 
+        # 임계치 알림: 특정 불량 유형이 전체 불량의 QUALITY_ALERT_THRESHOLD%를 넘으면
+        # 관련 부서(품질부/생산부)에 알림을 생성한다.
+        if max_defect['rate'] > QUALITY_ALERT_THRESHOLD:
+            alert_msg = (
+                f"⚠️ {max_defect['type']} 비중이 {max_defect['rate']}%로 "
+                f"임계치({QUALITY_ALERT_THRESHOLD}%)를 초과했습니다. 원인 분석이 필요합니다."
+            )
+            for dept in ('품질부', '생산부'):
+                notify_if_new(dept, alert_msg)
+
         processed_data['causeAnalysis'] = {
             'mainDefect': max_defect['type'],
             'causes': []
@@ -981,6 +1141,72 @@ def get_category_data_route(category):
             'message': '🔒 소속 부서 권한으로는 조회할 수 없는 데이터입니다. 담당 부서 또는 관리자에게 문의해주세요.'
         })
     return jsonify(get_category_data(category))
+
+
+# ---------- 알림 조회/읽음 처리 ----------
+@app.route('/api/notifications', methods=['GET'])
+@login_required
+def notifications_route():
+    unread_only = request.args.get('unread') == '1'
+    items = get_notifications(session['department'], session['role'], unread_only)
+    return jsonify({'notifications': items})
+
+
+@app.route('/api/notifications/<int:notification_id>/read', methods=['POST'])
+@login_required
+def mark_notification_read_route(notification_id):
+    conn = get_db()
+    conn.execute('UPDATE notifications SET is_read = 1 WHERE id = ?', (notification_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+
+# ---------- 응답 CSV 내보내기 ----------
+def extract_export_rows(export_type, data):
+    if not data:
+        return None, None
+    if export_type == 'financial' and data.get('monthly'):
+        return ['month', 'revenue', 'expense', 'profit'], data['monthly']
+    if export_type == 'production':
+        if data.get('monthly'):
+            return ['month', 'totalProduction', 'goodProducts', 'defectProducts', 'defectRate', 'efficiency'], data['monthly']
+        if data.get('products'):
+            return ['name', 'quantity', 'target', 'rate'], data['products']
+    if export_type == 'purchase' and data.get('orders'):
+        return ['supplier', 'item', 'amount', 'status'], data['orders']
+    if export_type == 'quality' and data.get('defectTypes'):
+        return ['type', 'count', 'rate'], data['defectTypes']
+    if export_type == 'quality_cause' and data.get('causeAnalysis', {}).get('causes'):
+        return ['cause', 'percent'], data['causeAnalysis']['causes']
+    if export_type == 'hr' and data.get('departments'):
+        return ['name', 'employees', 'attendance'], data['departments']
+    return None, None
+
+
+@app.route('/api/export', methods=['POST'])
+@login_required
+def export_route():
+    payload = request.json or {}
+    export_type = payload.get('type')
+    data = payload.get('data')
+
+    fieldnames, rows = extract_export_rows(export_type, data)
+    if not rows:
+        return jsonify({'error': '내보낼 표 형식 데이터가 없습니다.'}), 400
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(rows)
+
+    # Excel에서 한글이 깨지지 않도록 BOM 포함 UTF-8로 인코딩
+    csv_bytes = buffer.getvalue().encode('utf-8-sig')
+    return Response(
+        csv_bytes,
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=erp_export_{export_type}.csv'}
+    )
 
 
 def get_category_data(category):
