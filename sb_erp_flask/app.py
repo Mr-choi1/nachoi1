@@ -1,7 +1,29 @@
 import copy
+import os
+import requests
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
+
+# ---------- 포텐스닷(potens.ai) LLM 연동 ----------
+# 키는 코드에 직접 넣지 말고 환경변수 POTENS_API_KEY 로 설정합니다.
+POTENS_API_URL = 'https://ai.potens.ai/api/chat'
+POTENS_MODEL = 'claude-4-6-sonnet'
+
+
+def call_potens_ai(prompt):
+    api_key = os.environ.get('POTENS_API_KEY')
+    if not api_key:
+        raise RuntimeError('POTENS_API_KEY 환경변수가 설정되어 있지 않습니다.')
+
+    response = requests.post(
+        POTENS_API_URL,
+        json={'prompt': prompt, 'model': POTENS_MODEL},
+        headers={'Authorization': f'Bearer {api_key}'},
+        timeout=15
+    )
+    response.raise_for_status()
+    return response.json().get('message', '')
 
 
 # ---------- 웹 앱 실행 ----------
@@ -43,6 +65,20 @@ def process_ai_query(user_query):
 
     if any(k in query for k in ['전체', '모든', '종합']):
         return handle_comprehensive_query(query)
+
+    # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 포텐스닷 LLM에게 위임
+    try:
+        ai_answer = call_potens_ai(user_query)
+        return {
+            'type': 'text',
+            'data': None,
+            'message': (
+                f'🤖 {ai_answer}\n\n'
+                '※ ERP 정형 데이터가 아닌 AI 자유 응답입니다.'
+            )
+        }
+    except Exception as e:
+        print(f'Potens AI 호출 실패: {e}')
 
     return {
         'type': 'text',
