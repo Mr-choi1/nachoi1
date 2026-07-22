@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
+from datetime import datetime, timedelta
 from functools import wraps
 
 import requests
@@ -14,6 +15,34 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 # 운영 배포 시 반드시 SECRET_KEY 환경변수로 교체할 것 (세션 쿠키 서명에 사용됨)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# 세션 쿠키 보안 설정. SECURE는 HTTPS 환경(FLASK_ENV=production)에서만 켠다 —
+# 로컬 http 개발 환경에서 켜두면 쿠키가 전송되지 않아 로그인이 막힌다.
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FLASK_ENV') == 'production'
+
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 15
+
+
+@app.after_request
+def set_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    # index.html이 chart.js를 CDN에서 불러오고 스타일/스크립트가 인라인으로
+    # 작성되어 있어 script-src/style-src에 unsafe-inline이 불가피하다.
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
 
 # ---------- 사용자 DB (SQLite) ----------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'users.db')
@@ -59,6 +88,24 @@ def init_db():
             is_read INTEGER NOT NULL DEFAULT 0
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS query_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            query TEXT NOT NULL,
+            response_type TEXT NOT NULL,
+            response_message TEXT NOT NULL,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            username TEXT PRIMARY KEY,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT
+        )
+    ''')
     conn.commit()
 
     existing = conn.execute('SELECT COUNT(*) AS cnt FROM users').fetchone()['cnt']
@@ -84,6 +131,43 @@ def get_allowed_categories(department, role):
     if role == 'admin':
         return set(ALL_CATEGORIES)
     return set(DEPARTMENT_CATEGORY_ACCESS.get(department, set()))
+
+
+# ---------- 로그인 브루트포스 방지 ----------
+def is_locked_out(username):
+    conn = get_db()
+    row = conn.execute('SELECT locked_until FROM login_attempts WHERE username = ?', (username,)).fetchone()
+    conn.close()
+    if row and row['locked_until']:
+        locked_until = datetime.strptime(row['locked_until'], '%Y-%m-%d %H:%M:%S')
+        if datetime.now() < locked_until:
+            return locked_until
+    return None
+
+
+def record_failed_login(username):
+    conn = get_db()
+    row = conn.execute('SELECT failed_count FROM login_attempts WHERE username = ?', (username,)).fetchone()
+    failed_count = (row['failed_count'] if row else 0) + 1
+    locked_until = None
+    if failed_count >= LOGIN_MAX_ATTEMPTS:
+        locked_until = (datetime.now() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+        failed_count = 0
+
+    conn.execute('''
+        INSERT INTO login_attempts (username, failed_count, locked_until) VALUES (?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET failed_count = excluded.failed_count, locked_until = excluded.locked_until
+    ''', (username, failed_count, locked_until))
+    conn.commit()
+    conn.close()
+    return locked_until is not None
+
+
+def reset_failed_login(username):
+    conn = get_db()
+    conn.execute('DELETE FROM login_attempts WHERE username = ?', (username,))
+    conn.commit()
+    conn.close()
 
 
 # ---------- 임계치 알림 ----------
@@ -125,6 +209,28 @@ def get_notifications(department, role, unread_only=False):
     return [dict(row) for row in rows]
 
 
+# ---------- 조회 이력 / 즐겨찾기 ----------
+def log_query_history(user_id, query, response_type, response_message):
+    conn = get_db()
+    conn.execute(
+        'INSERT INTO query_history (user_id, query, response_type, response_message) VALUES (?, ?, ?, ?)',
+        (user_id, query, response_type, response_message)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_query_history(user_id, favorites_only=False):
+    conn = get_db()
+    query = 'SELECT * FROM query_history WHERE user_id = ?'
+    if favorites_only:
+        query += ' AND is_favorite = 1'
+    query += ' ORDER BY created_at DESC LIMIT 100'
+    rows = conn.execute(query, (user_id,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -143,18 +249,27 @@ def login():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
 
-        conn = get_db()
-        user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-        conn.close()
+        locked_until = is_locked_out(username)
+        if locked_until:
+            error = f'로그인 시도가 너무 많아 {locked_until.strftime("%H:%M")}까지 잠겼습니다. 잠시 후 다시 시도해주세요.'
+        else:
+            conn = get_db()
+            user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+            conn.close()
 
-        if user and check_password_hash(user['password_hash'], password):
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['department'] = user['department']
-            session['role'] = user['role']
-            return redirect(url_for('index'))
+            if user and check_password_hash(user['password_hash'], password):
+                reset_failed_login(username)
+                session['user_id'] = user['id']
+                session['username'] = user['username']
+                session['department'] = user['department']
+                session['role'] = user['role']
+                return redirect(url_for('index'))
 
-        error = '아이디 또는 비밀번호가 올바르지 않습니다.'
+            just_locked = record_failed_login(username)
+            error = (
+                f'로그인 시도가 너무 많아 {LOGIN_LOCKOUT_MINUTES}분간 잠겼습니다.'
+                if just_locked else '아이디 또는 비밀번호가 올바르지 않습니다.'
+            )
 
     return render_template('login.html', error=error)
 
@@ -234,6 +349,46 @@ def search_knowledge(query, top_k=2):
     return [doc for score, doc in scored[:top_k] if score >= top_score * 0.5]
 
 
+# ---------- 자주 묻는 질문 자동 매뉴얼(FAQ) 생성 ----------
+# 반복적으로 들어온 질문·답변을 knowledge/ 폴더에 문서로 누적해, 다음부터는
+# RAG 검색으로도 같은 질문에 답할 수 있게 한다 (스텝하우의 "자동 매뉴얼 누적" 개념).
+def generate_faq_document(min_count=2, top_n=15):
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT query, response_message, COUNT(*) AS cnt
+        FROM query_history
+        WHERE response_type != 'text'
+        GROUP BY query
+        HAVING cnt >= ?
+        ORDER BY cnt DESC
+        LIMIT ?
+    ''', (min_count, top_n)).fetchall()
+    conn.close()
+
+    if not rows:
+        return None
+
+    lines = [
+        '# 자주 묻는 질문 (자동 생성)',
+        '',
+        '이 문서는 챗봇 조회 이력을 기반으로 자동 생성되었습니다. 반복적으로 들어온 질문과',
+        '가장 최근 응답을 정리한 것으로, 실제 최신 수치는 챗봇에 직접 질의해 확인하세요.',
+        ''
+    ]
+    for row in rows:
+        lines.append(f"## {row['query']}")
+        lines.append(f"(누적 {row['cnt']}회 질의)")
+        lines.append('')
+        lines.append(row['response_message'])
+        lines.append('')
+
+    path = os.path.join(KNOWLEDGE_DIR, '자동생성_FAQ.md')
+    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    return path
+
+
 # ---------- 오타 보정 (레벤슈타인 유사도) ----------
 # 각 카테고리 키워드 목록 자체가 유사어 사전 역할을 하고,
 # 여기에 오타까지 허용하기 위해 단어 단위 유사도 매칭을 함께 사용한다.
@@ -304,6 +459,7 @@ def index():
         'index.html',
         username=session['username'],
         department=session['department'],
+        role=session['role'],
         allowed_categories=allowed
     )
 
@@ -314,7 +470,12 @@ def index():
 def process_ai_query_route():
     user_query = request.json.get('query', '')
     allowed = get_allowed_categories(session['department'], session['role'])
-    return jsonify(process_ai_query(user_query, allowed, session['department']))
+    result = process_ai_query(user_query, allowed, session['department'])
+
+    if user_query.strip():
+        log_query_history(session['user_id'], user_query, result.get('type', 'text'), result.get('message', ''))
+
+    return jsonify(result)
 
 
 def process_ai_query(user_query, allowed_categories=None, department=None):
@@ -761,15 +922,23 @@ def handle_quality_query(query, period, is_comparison, specific_item, stats_type
 
         message += f"📊 주요 불량 유형: {max_defect['type']} ({max_defect['count']}건, {max_defect['rate']}%)\n\n"
 
-        # 임계치 알림: 특정 불량 유형이 전체 불량의 QUALITY_ALERT_THRESHOLD%를 넘으면
-        # 관련 부서(품질부/생산부)에 알림을 생성한다.
+        # 임계치 알림 (미니 플레이북): 특정 불량 유형이 전체 불량의
+        # QUALITY_ALERT_THRESHOLD%를 넘으면 담당부서(품질부)에는 조치 필요 알림을,
+        # 관련부서(생산부)에는 참고용 알림을 각각 생성한다.
         if max_defect['rate'] > QUALITY_ALERT_THRESHOLD:
-            alert_msg = (
-                f"⚠️ {max_defect['type']} 비중이 {max_defect['rate']}%로 "
-                f"임계치({QUALITY_ALERT_THRESHOLD}%)를 초과했습니다. 원인 분석이 필요합니다."
+            owner_dept, related_dept = '품질부', '생산부'
+            summary = (
+                f"{max_defect['type']} 비중이 {max_defect['rate']}%로 "
+                f"임계치({QUALITY_ALERT_THRESHOLD}%)를 초과했습니다."
             )
-            for dept in ('품질부', '생산부'):
-                notify_if_new(dept, alert_msg)
+            notify_if_new(
+                owner_dept,
+                f"⚠️ [조치필요 · 담당: {owner_dept}] {summary} 원인 분석 후 알림에서 조치 완료로 표시해주세요."
+            )
+            notify_if_new(
+                related_dept,
+                f"📋 [참고] {summary} 담당부서({owner_dept})에서 원인 분석 중입니다."
+            )
 
         processed_data['causeAnalysis'] = {
             'mainDefect': max_defect['type'],
@@ -1160,6 +1329,46 @@ def mark_notification_read_route(notification_id):
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
+
+
+# ---------- 조회 이력 / 즐겨찾기 라우트 ----------
+@app.route('/api/history', methods=['GET'])
+@login_required
+def history_route():
+    favorites_only = request.args.get('favorites') == '1'
+    items = get_query_history(session['user_id'], favorites_only)
+    return jsonify({'history': items})
+
+
+@app.route('/api/history/<int:history_id>/favorite', methods=['POST'])
+@login_required
+def toggle_favorite_route(history_id):
+    conn = get_db()
+    row = conn.execute(
+        'SELECT is_favorite FROM query_history WHERE id = ? AND user_id = ?',
+        (history_id, session['user_id'])
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': '이력을 찾을 수 없습니다.'}), 404
+
+    new_value = 0 if row['is_favorite'] else 1
+    conn.execute('UPDATE query_history SET is_favorite = ? WHERE id = ?', (new_value, history_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'is_favorite': bool(new_value)})
+
+
+@app.route('/api/generate-faq', methods=['POST'])
+@login_required
+def generate_faq_route():
+    if session['role'] != 'admin':
+        return jsonify({'error': '관리자만 사용할 수 있습니다.'}), 403
+
+    path = generate_faq_document()
+    if not path:
+        return jsonify({'ok': False, 'message': '아직 반복 질의가 충분히 쌓이지 않았습니다 (동일 질문 2회 이상 필요).'})
+    return jsonify({'ok': True, 'message': 'FAQ 문서를 생성해 사내 지식 문서(knowledge)에 반영했습니다.'})
 
 
 # ---------- 응답 CSV 내보내기 ----------

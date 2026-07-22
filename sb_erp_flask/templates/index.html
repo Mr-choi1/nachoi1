@@ -321,10 +321,17 @@
         <span>SB선보</span>
       </div>
       <div style="display: flex; align-items: center; gap: 16px; position: relative;">
+        <div style="position: relative; cursor: pointer;" id="historyBtn" onclick="toggleHistory()">
+          🕘
+          <div id="historyPanel" style="display:none; position:absolute; top:28px; right:0; width:360px; max-height:400px; overflow-y:auto; background:white; border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.2); z-index:10; text-align:left;"></div>
+        </div>
         <div style="position: relative; cursor: pointer;" id="notifBell" onclick="toggleNotifications()">
           🔔<span id="notifBadge" style="display:none; position:absolute; top:-6px; right:-10px; background:#e74c3c; color:white; font-size:11px; font-weight:bold; border-radius:10px; padding:1px 6px;">0</span>
           <div id="notifPanel" style="display:none; position:absolute; top:28px; right:0; width:320px; max-height:360px; overflow-y:auto; background:white; border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.2); z-index:10; text-align:left;"></div>
         </div>
+        {% if role == 'admin' %}
+        <button onclick="generateFaq()" style="padding:8px 14px; background:#f0f4ff; color:#1e3c72; border:none; border-radius:8px; font-size:13px; font-weight:bold; cursor:pointer;">📚 FAQ 자동생성</button>
+        {% endif %}
         <div style="color: #666; font-size: 14px;">{{ department }} · {{ username }}님</div>
         <a href="{{ url_for('logout') }}" style="color: #1e3c72; font-size: 14px; font-weight: bold; text-decoration: none;">로그아웃</a>
       </div>
@@ -451,6 +458,58 @@
     // 최초 로드 및 60초 주기로 알림 갱신
     fetchNotifications();
     setInterval(fetchNotifications, 60000);
+
+    // 조회 이력 / 즐겨찾기
+    function toggleHistory() {
+      const panel = document.getElementById('historyPanel');
+      const isOpen = panel.style.display === 'block';
+      panel.style.display = isOpen ? 'none' : 'block';
+      if (!isOpen) fetchHistory();
+    }
+
+    function fetchHistory() {
+      fetch('/api/history')
+        .then(res => res.json())
+        .then(data => renderHistory(data.history || []))
+        .catch(() => {});
+    }
+
+    function renderHistory(items) {
+      const panel = document.getElementById('historyPanel');
+      if (items.length === 0) {
+        panel.innerHTML = '<div style="padding:16px; color:#999; font-size:13px;">아직 조회 이력이 없습니다.</div>';
+        return;
+      }
+
+      panel.innerHTML = items.map(h => `
+        <div style="padding:10px 14px; border-bottom:1px solid #f0f0f0; font-size:13px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <div style="flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" onclick="rerunQuery(${JSON.stringify(h.query)})" title="${h.query}">
+            ${h.query}
+          </div>
+          <span onclick="toggleFavorite(${h.id}, event)" style="cursor:pointer; font-size:15px;">${h.is_favorite ? '⭐' : '☆'}</span>
+        </div>
+      `).join('');
+    }
+
+    function rerunQuery(query) {
+      document.getElementById('historyPanel').style.display = 'none';
+      document.getElementById('userInput').value = query;
+      sendMessage();
+    }
+
+    function toggleFavorite(id, event) {
+      event.stopPropagation();
+      fetch(`/api/history/${id}/favorite`, { method: 'POST' })
+        .then(() => fetchHistory());
+    }
+
+    // 관리자 전용: 반복 질의를 사내 FAQ 문서로 자동 생성
+    function generateFaq() {
+      fetch('/api/generate-faq', { method: 'POST' })
+        .then(res => res.json())
+        .then(data => alert(data.message))
+        .catch(() => alert('FAQ 생성에 실패했습니다.'));
+    }
 
     // 엔터키 처리
     function handleKeyPress(event) {
