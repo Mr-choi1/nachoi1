@@ -85,7 +85,8 @@ def init_db():
             department TEXT NOT NULL,
             message TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-            is_read INTEGER NOT NULL DEFAULT 0
+            is_read INTEGER NOT NULL DEFAULT 0,
+            resolution_comment TEXT
         )
     ''')
     conn.execute('''
@@ -505,7 +506,7 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
     elif contains_keyword(query, ['인사', '직원', '사원', '근태', '부서']):
         result = handle_hr_query(query, period, is_comparison, specific_item, stats_type)
     elif contains_keyword(query, ['전체', '모든', '종합']):
-        result = handle_comprehensive_query(query)
+        result = handle_comprehensive_query(query, allowed_categories)
 
     if result:
         if allowed_categories is not None and result.get('type') not in allowed_categories:
@@ -1158,17 +1159,34 @@ def handle_hr_query(query, period, is_comparison, specific_item, stats_type):
 
 
 # ---------- 종합 질문 처리 ----------
-def handle_comprehensive_query(query):
+DOMAIN_LABELS = {'financial': '재무', 'production': '생산', 'purchase': '구매', 'quality': '품질', 'hr': '인사'}
+
+
+def handle_comprehensive_query(query, allowed_categories=None):
+    all_data = {
+        'financial': get_financial_data()['summary'],
+        'production': get_production_data()['summary'],
+        'purchase': get_purchase_data()['summary'],
+        'quality': get_quality_data()['summary'],
+        'hr': get_hr_data()['summary']
+    }
+
+    # RBAC: '종합' 응답이라도 소속 부서 권한 밖 영역의 데이터는 포함하지 않는다.
+    if allowed_categories is not None:
+        visible_data = {k: v for k, v in all_data.items() if k in allowed_categories}
+    else:
+        visible_data = all_data
+
+    if not visible_data:
+        message = '🔒 소속 부서 권한으로 조회 가능한 종합 현황 항목이 없습니다.'
+    else:
+        labels = ', '.join(DOMAIN_LABELS[k] for k in visible_data)
+        message = f'전체 경영 현황을 조회했습니다. (조회 가능 영역: {labels})'
+
     return {
         'type': 'comprehensive',
-        'data': {
-            'financial': get_financial_data()['summary'],
-            'production': get_production_data()['summary'],
-            'purchase': get_purchase_data()['summary'],
-            'quality': get_quality_data()['summary'],
-            'hr': get_hr_data()['summary']
-        },
-        'message': '전체 경영 현황을 조회했습니다.',
+        'data': visible_data,
+        'message': message,
         'query': query
     }
 
@@ -1324,8 +1342,16 @@ def notifications_route():
 @app.route('/api/notifications/<int:notification_id>/read', methods=['POST'])
 @login_required
 def mark_notification_read_route(notification_id):
+    comment = (request.json or {}).get('comment') if request.is_json else None
+
     conn = get_db()
-    conn.execute('UPDATE notifications SET is_read = 1 WHERE id = ?', (notification_id,))
+    if comment:
+        conn.execute(
+            'UPDATE notifications SET is_read = 1, resolution_comment = ? WHERE id = ?',
+            (comment, notification_id)
+        )
+    else:
+        conn.execute('UPDATE notifications SET is_read = 1 WHERE id = ?', (notification_id,))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})

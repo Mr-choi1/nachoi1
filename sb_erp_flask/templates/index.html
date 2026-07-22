@@ -381,6 +381,7 @@
   <script>
     let currentChart = null; // 차트 인스턴스 저장
     let lastResponse = null; // CSV 내보내기용 마지막 응답 저장
+    let lastNotifications = []; // 알림 클릭 시 메시지 확인용 마지막 알림 목록
 
     // CSV 내보내기
     function exportCSV() {
@@ -433,10 +434,13 @@
         return;
       }
 
+      lastNotifications = items;
+
       panel.innerHTML = items.map(n => `
-        <div onclick="markNotificationRead(${n.id}, event)"
-             style="padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:13px; cursor:pointer; background:${n.is_read ? 'white' : '#eef4ff'};">
+        <div ${n.is_read ? '' : `onclick="markNotificationRead(${n.id}, event)"`}
+             style="padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:13px; cursor:${n.is_read ? 'default' : 'pointer'}; background:${n.is_read ? 'white' : '#eef4ff'};">
           <div style="color:#333; line-height:1.5;">${n.message}</div>
+          ${n.resolution_comment ? `<div style="color:#1e3c72; font-size:12px; margin-top:4px;">💬 ${n.resolution_comment}</div>` : ''}
           <div style="color:#999; font-size:11px; margin-top:4px;">${n.department} · ${n.created_at}</div>
         </div>
       `).join('');
@@ -451,8 +455,18 @@
 
     function markNotificationRead(id, event) {
       event.stopPropagation();
-      fetch(`/api/notifications/${id}/read`, { method: 'POST' })
-        .then(() => fetchNotifications());
+
+      const item = lastNotifications.find(n => n.id === id);
+      let comment = null;
+      if (item && item.message.includes('[조치필요')) {
+        comment = prompt('조치 내용을 간단히 남겨주세요 (취소해도 완료 처리됩니다):', '');
+      }
+
+      fetch(`/api/notifications/${id}/read`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comment: comment || null })
+      }).then(() => fetchNotifications());
     }
 
     // 최초 로드 및 60초 주기로 알림 갱신
