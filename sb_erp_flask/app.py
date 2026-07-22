@@ -4,13 +4,18 @@ import io
 import os
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from functools import wraps
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# sb_erp_flask/.env 파일이 있으면 그 안의 값들을 환경변수로 읽어들인다.
+load_dotenv()
 
 app = Flask(__name__)
 # 운영 배포 시 반드시 SECRET_KEY 환경변수로 교체할 것 (세션 쿠키 서명에 사용됨)
@@ -480,6 +485,10 @@ def process_ai_query_route():
 
 
 def process_ai_query(user_query, allowed_categories=None, department=None):
+    # 브라우저/IME에 따라 한글이 조합형(NFD)으로 넘어오면 '메출' 같은 문자열이
+    # 우리 코드의 조합완성형(NFC) 키워드와 바이트 단위로 달라 매칭이 실패할 수 있다.
+    # 항상 NFC로 정규화해서 비교한다.
+    user_query = unicodedata.normalize('NFC', user_query)
     query = user_query.lower()
 
     period = extract_period(query)
@@ -517,10 +526,12 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
             }
         return enrich_structured_response(result)
 
-    # 정형 카테고리 키워드에 걸리지 않은 자유 질문은 사내 문서(RAG) 검색 후 포텐스닷 LLM에게 위임
+    # 정형 카테고리 키워드에 걸리지 않은 질문은 사내 문서(RAG)에서 근거를 찾은 경우에만
+    # AI가 답변한다. 사내 데이터/문서에서 찾을 수 없는 내용은 일반 지식으로 답하지 않고
+    # 아래 안내 메시지로 넘어간다 (일반 상식/외부지식 자유 응답은 제공하지 않음).
     knowledge_hits = search_knowledge(user_query)
-    try:
-        if knowledge_hits:
+    if knowledge_hits:
+        try:
             context_text = '\n\n'.join(
                 f"[{doc['title']}]\n{doc['content']}" for doc in knowledge_hits
             )
@@ -539,18 +550,8 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
                     f'※ 참고 문서: {sources}'
                 )
             }
-
-        ai_answer = call_potens_ai(user_query)
-        return {
-            'type': 'text',
-            'data': None,
-            'message': (
-                f'🤖 {ai_answer}\n\n'
-                '※ ERP 정형 데이터가 아닌 AI 자유 응답입니다.'
-            )
-        }
-    except Exception as e:
-        print(f'Potens AI 호출 실패: {e}')
+        except Exception as e:
+            print(f'Potens AI 호출 실패: {e}')
 
     suggestions = get_suggestions(query)
     suggestion_text = ''
