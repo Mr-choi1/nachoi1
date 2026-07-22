@@ -3,37 +3,64 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SB선보 ERP 시스템 - 로그인</title>
+  <title>SB선보 ERP AI - 로그인</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
+    :root {
+      --bg-sidebar: rgba(223, 245, 248, 0.86);
+      --bg: rgba(235, 250, 252, 0.62);
+      --bg-panel: #FFFFFF;
+      --border: #C3E6EA;
+      --text: #0B2B36;
+      --text-muted: #4B7481;
+      --text-faint: #86AAB3;
+      --accent: #1E90FF;
+      --accent-hover: #0000FF;
+      --accent-contrast: #FFFFFF;
+      --shadow: 0 4px 20px rgba(6, 40, 51, 0.15);
     }
 
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-sidebar: rgba(9, 32, 45, 0.9);
+        --bg: rgba(6, 24, 35, 0.62);
+        --bg-panel: #0E2B3A;
+        --border: #1C4B60;
+        --text: #E3F6F8;
+        --text-muted: #93C2CC;
+        --text-faint: #5C8B96;
+        --accent: #00CED1;
+        --accent-hover: #1E90FF;
+        --accent-contrast: #052430;
+      }
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", "Malgun Gothic", Roboto, Helvetica, Arial, sans-serif;
+      background: linear-gradient(180deg, var(--bg-sidebar) 0%, var(--bg) 55%, var(--bg) 100%);
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
       padding: 20px;
+      color: var(--text);
     }
 
     .login-box {
-      background: white;
+      background: var(--bg-panel);
       width: 100%;
       max-width: 380px;
       padding: 40px 35px;
-      border-radius: 15px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      border: 1px solid var(--border);
     }
 
     .logo {
-      font-size: 26px;
-      font-weight: bold;
-      color: #1e3c72;
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text);
       display: flex;
       align-items: center;
       gap: 10px;
@@ -41,86 +68,67 @@
     }
 
     .logo-icon {
-      width: 42px;
-      height: 42px;
-      background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-      border-radius: 10px;
+      width: 40px;
+      height: 40px;
+      background: var(--accent);
+      border-radius: 12px;
       display: flex;
       align-items: center;
       justify-content: center;
-      color: white;
-      font-weight: bold;
-      font-size: 20px;
+      color: var(--accent-contrast);
+      font-weight: 700;
+      font-size: 18px;
     }
 
-    .subtitle {
-      color: #666;
-      font-size: 14px;
-      margin-bottom: 30px;
-    }
+    .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 30px; }
 
-    label {
-      display: block;
-      font-size: 13px;
-      color: #444;
-      margin-bottom: 6px;
-      font-weight: bold;
-    }
+    label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 6px; font-weight: 600; }
 
     input {
       width: 100%;
       padding: 12px 14px;
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
       font-size: 15px;
       margin-bottom: 18px;
       outline: none;
+      background: transparent;
+      color: var(--text);
       transition: border-color 0.2s;
     }
-
-    input:focus {
-      border-color: #1e3c72;
-    }
+    input:focus { border-color: var(--accent); }
 
     button {
       width: 100%;
       padding: 13px;
-      background: #1e3c72;
-      color: white;
+      background: var(--accent);
+      color: var(--accent-contrast);
       border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      font-weight: bold;
+      border-radius: 10px;
+      font-size: 15.5px;
+      font-weight: 700;
       cursor: pointer;
       transition: background 0.2s;
     }
-
-    button:hover {
-      background: #2a5298;
-    }
+    button:hover { background: var(--accent-hover); }
 
     .error {
-      background: #fdecea;
-      color: #c0392b;
+      background: rgba(231, 76, 60, 0.12);
+      color: #e74c3c;
       padding: 10px 14px;
-      border-radius: 8px;
+      border-radius: 10px;
       font-size: 13px;
       margin-bottom: 18px;
     }
 
-    .hint {
-      margin-top: 20px;
-      font-size: 12px;
-      color: #999;
-      line-height: 1.6;
-    }
+    .hint { margin-top: 20px; font-size: 12px; color: var(--text-faint); line-height: 1.6; }
   </style>
 </head>
 <body>
   <div class="login-box">
     <div class="logo">
       <div class="logo-icon">SB</div>
-      <span>SB선보 ERP</span>
+      <span>SB선보 ERP AI</span>
     </div>
     <div class="subtitle">부서 계정으로 로그인하세요</div>
 
