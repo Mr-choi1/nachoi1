@@ -7,6 +7,8 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <style>
     :root {
       /* 오션 블루 팔레트 (sb_ai_erp_assistant 디자인 이식) */
@@ -253,12 +255,22 @@
     .chart-container { margin: 12px 0; padding: 12px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-md); }
     .chart-container canvas { max-height: 280px; }
 
-    .msg-actions { display: flex; gap: 8px; margin-top: 10px; }
+    .msg-actions { margin-top: 10px; }
     .msg-export-btn {
       padding: 6px 12px; background: var(--bg-panel); border: 1px solid var(--border);
       border-radius: var(--radius-sm); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
     }
     .msg-export-btn:hover { background: var(--bg-hover); }
+    .export-format-menu {
+      display: none; gap: 8px; margin-top: 8px;
+    }
+    .export-format-menu.show { display: flex; }
+    .export-format-btn {
+      padding: 6px 12px; background: var(--bg-hover); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .export-format-btn:hover { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+    .export-format-btn:disabled { opacity: 0.6; cursor: wait; }
 
     /* ---------- Composer ---------- */
     .composer-wrap { padding: 10px 16px 16px; }
@@ -548,7 +560,13 @@
         if (response.data) {
           html += '<div class="result-slot" id="' + uid + '-slot"></div>';
           if (EXPORTABLE_TYPES.indexOf(response.type) !== -1) {
-            html += '<div class="msg-actions"><button class="msg-export-btn" onclick="exportCSV(\'' + uid + '\')">⬇ CSV 내보내기</button></div>';
+            html += '<div class="msg-actions">' +
+              '<button class="msg-export-btn" onclick="toggleExportMenu(\'' + uid + '\')">⬇ 내보내기</button>' +
+              '<div class="export-format-menu" id="' + uid + '-exportmenu">' +
+              '<button class="export-format-btn" onclick="exportExcel(\'' + uid + '\', this)">📊 엑셀</button>' +
+              '<button class="export-format-btn" onclick="exportPDF(\'' + uid + '\', this)">📄 PDF</button>' +
+              '</div>' +
+              '</div>';
           }
         }
         html += '</div>';
@@ -627,27 +645,91 @@
         closeSidebar();
       };
 
-      /* ---------- CSV 내보내기 ---------- */
-      window.exportCSV = function (uid) {
+      /* ---------- 내보내기: 버튼 클릭 시 엑셀/PDF 선택 메뉴 펼치기 ---------- */
+      window.toggleExportMenu = function (uid) {
+        var menu = document.getElementById(uid + '-exportmenu');
+        if (menu) menu.classList.toggle('show');
+      };
+
+      function downloadBlob(blob, filename) {
+        var url = window.URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      }
+
+      // 엑셀(.xlsx): 서버에서 openpyxl로 실제 엑셀 파일 생성
+      window.exportExcel = function (uid, btn) {
         var response = msgDataRegistry[uid];
         if (!response) return;
+        btn.disabled = true;
         fetch('/api/export', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: response.type, data: response.data })
+          body: JSON.stringify({ type: response.type, data: response.data, format: 'excel' })
         })
           .then(function (res) { if (!res.ok) throw new Error('export failed'); return res.blob(); })
-          .then(function (blob) {
-            var url = window.URL.createObjectURL(blob);
-            var a = document.createElement('a');
-            a.href = url;
-            a.download = 'erp_export_' + response.type + '.csv';
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            window.URL.revokeObjectURL(url);
-          })
-          .catch(function () { alert('내보내기에 실패했습니다.'); });
+          .then(function (blob) { downloadBlob(blob, 'erp_export_' + response.type + '.xlsx'); })
+          .catch(function () { alert('엑셀 내보내기에 실패했습니다.'); })
+          .finally(function () { btn.disabled = false; });
+      };
+
+      // PDF: 서버 없이 브라우저에 이미 렌더링된 결과 화면을 캡처해서 PDF로 만든다.
+      // (서버에서 PDF를 만들면 한글 폰트를 따로 심어야 해서 깨지기 쉬움 — 이미 화면에
+      // 정상적으로 그려진 한글을 이미지로 캡처하는 방식이 훨씬 안전하다.)
+      window.exportPDF = function (uid, btn) {
+        var response = msgDataRegistry[uid];
+        var slot = document.getElementById(uid + '-slot');
+        if (!response || !slot || !window.html2canvas || !window.jspdf) {
+          alert('PDF 생성에 필요한 라이브러리를 불러오지 못했습니다.');
+          return;
+        }
+        btn.disabled = true;
+        var bg = getComputedStyle(document.body).getPropertyValue('--bg-panel').trim() || '#ffffff';
+
+        html2canvas(slot, { backgroundColor: bg, scale: 2 }).then(function (canvas) {
+          var imgData = canvas.toDataURL('image/png');
+          var pdf = new window.jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+          var pageWidth = pdf.internal.pageSize.getWidth();
+          var pageHeight = pdf.internal.pageSize.getHeight();
+          var margin = 24;
+          var imgWidth = pageWidth - margin * 2;
+          var imgHeight = canvas.height * imgWidth / canvas.width;
+
+          var y = margin;
+          var remainingHeight = imgHeight;
+          var sourceY = 0;
+
+          // 결과가 A4 한 페이지보다 길면 여러 페이지로 나눠서 이어 붙인다.
+          while (remainingHeight > 0) {
+            var sliceHeightPt = Math.min(pageHeight - margin * 2, remainingHeight);
+            var sliceHeightPx = sliceHeightPt * canvas.width / imgWidth;
+
+            var pageCanvas = document.createElement('canvas');
+            pageCanvas.width = canvas.width;
+            pageCanvas.height = sliceHeightPx;
+            var ctx = pageCanvas.getContext('2d');
+            ctx.fillStyle = bg;
+            ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+            ctx.drawImage(canvas, 0, sourceY, canvas.width, sliceHeightPx, 0, 0, canvas.width, sliceHeightPx);
+
+            if (y !== margin) pdf.addPage();
+            pdf.addImage(pageCanvas.toDataURL('image/png'), 'PNG', margin, margin, imgWidth, sliceHeightPt);
+
+            sourceY += sliceHeightPx;
+            remainingHeight -= sliceHeightPt;
+          }
+
+          pdf.save('erp_export_' + response.type + '.pdf');
+        }).catch(function () {
+          alert('PDF 내보내기에 실패했습니다.');
+        }).finally(function () {
+          btn.disabled = false;
+        });
       };
 
       /* ---------- 알림 ---------- */

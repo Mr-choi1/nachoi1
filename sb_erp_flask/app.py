@@ -12,6 +12,8 @@ from functools import wraps
 import requests
 from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # sb_erp_flask/.env 파일이 있으면 그 안의 값들을 환경변수로 읽어들인다.
@@ -1462,16 +1464,61 @@ def extract_export_rows(export_type, data):
     return None, None
 
 
+EXPORT_SHEET_TITLES = {
+    'financial': '재무',
+    'production': '생산',
+    'purchase': '구매',
+    'quality': '품질',
+    'quality_cause': '불량원인',
+    'hr': '인사'
+}
+
+
+def build_excel_response(export_type, fieldnames, rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (EXPORT_SHEET_TITLES.get(export_type, export_type) or export_type)[:31]
+
+    header_fill = PatternFill(start_color='1E90FF', end_color='1E90FF', fill_type='solid')
+    header_font = Font(color='FFFFFF', bold=True)
+
+    ws.append(fieldnames)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for row in rows:
+        ws.append([row.get(f, '') for f in fieldnames])
+
+    for i, col in enumerate(fieldnames, start=1):
+        max_len = max([len(str(col))] + [len(str(row.get(col, ''))) for row in rows])
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max_len + 4
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    return Response(
+        buffer.read(),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': f'attachment; filename=erp_export_{export_type}.xlsx'}
+    )
+
+
 @app.route('/api/export', methods=['POST'])
 @login_required
 def export_route():
     payload = request.json or {}
     export_type = payload.get('type')
     data = payload.get('data')
+    export_format = payload.get('format', 'excel')
 
     fieldnames, rows = extract_export_rows(export_type, data)
     if not rows:
         return jsonify({'error': '내보낼 표 형식 데이터가 없습니다.'}), 400
+
+    if export_format == 'excel':
+        return build_excel_response(export_type, fieldnames, rows)
 
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction='ignore')
