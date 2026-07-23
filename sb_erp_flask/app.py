@@ -671,6 +671,17 @@ def extract_specific_item(query):
     if '포장' in query:
         return '포장 불량'
 
+    if '대한소재' in query:
+        return '대한소재'
+    if '글로벌부품' in query:
+        return '글로벌부품'
+    if '한국화학' in query:
+        return '한국화학'
+    if '프리미엄자재' in query:
+        return '프리미엄자재'
+    if '스마트부품' in query:
+        return '스마트부품상사'
+
     return None
 
 
@@ -700,9 +711,19 @@ def handle_financial_query(query, period, is_comparison, specific_item, stats_ty
     message = ''
     processed_data = copy.deepcopy(data)
 
+    period_label = None
     if period['type'] == 'specific' and period['value']:
         processed_data['monthly'] = [m for m in data['monthly'] if m['month'] in period['value']]
-        message += f"📅 {', '.join(period['value'])} 재무 데이터:\n\n"
+        period_label = ', '.join(period['value'])
+    elif period['type'] == 'recent':
+        processed_data['monthly'] = data['monthly'][-3:]
+        period_label = f"최근 {len(processed_data['monthly'])}개월(" + ', '.join(m['month'] for m in processed_data['monthly']) + ")"
+    elif period['type'] == 'past' and len(data['monthly']) >= 2:
+        processed_data['monthly'] = [data['monthly'][-2]]
+        period_label = f"지난달({processed_data['monthly'][0]['month']})"
+
+    if period_label:
+        message += f"📅 {period_label} 재무 데이터:\n\n"
 
         for m in processed_data['monthly']:
             message += f"[{m['month']}]\n"
@@ -783,9 +804,19 @@ def handle_production_query(query, period, is_comparison, specific_item, stats_t
     message = ''
     processed_data = copy.deepcopy(data)
 
+    period_label = None
     if period['type'] == 'specific' and period['value']:
         processed_data['monthly'] = [m for m in data['monthly'] if m['month'] in period['value']]
-        message += f"📅 {', '.join(period['value'])} 생산 데이터:\n\n"
+        period_label = ', '.join(period['value'])
+    elif period['type'] == 'recent':
+        processed_data['monthly'] = data['monthly'][-3:]
+        period_label = f"최근 {len(processed_data['monthly'])}개월(" + ', '.join(m['month'] for m in processed_data['monthly']) + ")"
+    elif period['type'] == 'past' and len(data['monthly']) >= 2:
+        processed_data['monthly'] = [data['monthly'][-2]]
+        period_label = f"지난달({processed_data['monthly'][0]['month']})"
+
+    if period_label:
+        message += f"📅 {period_label} 생산 데이터:\n\n"
 
         for m in processed_data['monthly']:
             message += f"[{m['month']}]\n"
@@ -870,14 +901,25 @@ def handle_purchase_query(query, period, is_comparison, specific_item, stats_typ
     message = ''
     processed_data = copy.deepcopy(data)
 
+    if specific_item:
+        processed_data['orders'] = [o for o in processed_data['orders'] if specific_item in o['supplier']]
+        if processed_data['orders']:
+            total = sum(o['amount'] for o in processed_data['orders'])
+            message += f"🏢 {specific_item} 발주 내역 ({len(processed_data['orders'])}건, 총 {format_number(total)}원):\n\n"
+            for o in processed_data['orders']:
+                message += f"- {o['item']}: {format_number(o['amount'])}원 ({o['status']})\n"
+            message += "\n"
+        else:
+            message += f"🏢 {specific_item} 관련 발주 내역이 없습니다.\n\n"
+
     if '완료' in query:
-        processed_data['orders'] = [o for o in data['orders'] if o['status'] == '완료']
+        processed_data['orders'] = [o for o in processed_data['orders'] if o['status'] == '완료']
         message += f"✅ 완료된 발주: {len(processed_data['orders'])}건\n\n"
     elif '진행' in query or '대기' in query:
-        processed_data['orders'] = [o for o in data['orders'] if o['status'] != '완료']
+        processed_data['orders'] = [o for o in processed_data['orders'] if o['status'] != '완료']
         message += f"⏳ 진행중/대기 발주: {len(processed_data['orders'])}건\n\n"
 
-    if stats_type:
+    if stats_type and processed_data['orders']:
         amounts = [o['amount'] for o in processed_data['orders']]
 
         if stats_type == 'max':

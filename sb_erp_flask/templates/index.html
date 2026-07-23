@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SB선보 ERP AI</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <style>
     :root {
       /* 오션 블루 팔레트 (sb_ai_erp_assistant 디자인 이식) */
@@ -207,7 +209,26 @@
     .msg-avatar { width: 28px; height: 28px; border-radius: 8px; background: var(--accent); color: var(--accent-contrast); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex: none; }
     .msg-body { max-width: 84%; min-width: 0; }
     .msg-user .msg-body { background: var(--user-bubble); padding: 10px 14px; border-radius: var(--radius-md); }
-    .msg-text { font-size: 14.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+    .msg-text { font-size: 14.5px; line-height: 1.65; word-break: break-word; }
+    .msg-text p { margin: 0 0 10px; }
+    .msg-text p:last-child { margin-bottom: 0; }
+    .msg-text ul, .msg-text ol { margin: 0 0 10px; padding-left: 22px; }
+    .msg-text li { margin-bottom: 4px; }
+    .msg-text h1, .msg-text h2, .msg-text h3, .msg-text h4 { margin: 14px 0 8px; color: var(--text); line-height: 1.4; }
+    .msg-text h1:first-child, .msg-text h2:first-child, .msg-text h3:first-child { margin-top: 0; }
+    .msg-text h1 { font-size: 18px; }
+    .msg-text h2 { font-size: 16.5px; }
+    .msg-text h3 { font-size: 15px; }
+    .msg-text strong { color: var(--text); font-weight: 700; }
+    .msg-text code { background: var(--bg-hover); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+    .msg-text pre { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 10px 12px; overflow-x: auto; margin: 0 0 10px; }
+    .msg-text pre code { background: none; padding: 0; }
+    .msg-text blockquote { border-left: 3px solid var(--border); margin: 0 0 10px; padding: 2px 12px; color: var(--text-muted); }
+    .msg-text hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+    .msg-text a { color: var(--accent); }
+    .msg-text table { border-collapse: collapse; width: 100%; margin: 0 0 10px; font-size: 13px; display: block; overflow-x: auto; }
+    .msg-text th, .msg-text td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+    .msg-text th { background: var(--bg-hover); font-weight: 600; }
     .msg-footer { font-size: 12px; color: var(--text-faint); margin-top: 8px; white-space: pre-line; }
 
     .typing { display: inline-flex; gap: 4px; padding: 4px 0; }
@@ -532,7 +553,7 @@
         }
         html += '</div>';
         row.innerHTML = html;
-        row.querySelector('.msg-text').textContent = response.message || '';
+        row.querySelector('.msg-text').innerHTML = renderMarkdown(response.message || '');
         messagesEl.appendChild(row);
 
         if (response.data) {
@@ -740,6 +761,18 @@
         return div.innerHTML;
       }
       window.escapeHtml = escapeHtml;
+
+      // AI/RAG 응답이 마크다운(##, **, |표| 등)으로 오는 경우가 많아 그대로
+      // 렌더링한다. breaks:true로 우리가 직접 만든 일반 메시지(줄바꿈 \n 기반)도
+      // 마크다운 문법 없이 그대로 줄바꿈이 유지되도록 한다.
+      window.renderMarkdown = function (text) {
+        if (!text) return '';
+        if (window.marked && window.DOMPurify) {
+          var html = marked.parse(text, { breaks: true });
+          return DOMPurify.sanitize(html);
+        }
+        return escapeHtml(text).replace(/\n/g, '<br>');
+      };
     })();
 
     /* ================= 결과 렌더링 (표/카드) ================= */
