@@ -397,6 +397,65 @@ def generate_faq_document(min_count=2, top_n=15):
     return path
 
 
+# ---------- 부서별 ERP 사용 가이드 자동 생성 ----------
+# 스텝하우의 "부서/직무별 매뉴얼" 컨셉을, 화면 캡처 대신 부서 조회 권한 +
+# 사내 문서를 조합한 텍스트 가이드로 구현. 부서마다 조회 가능한 항목이 달라
+# 자동으로 각자 다른 내용의 가이드가 만들어진다.
+EXAMPLE_QUERIES_BY_CATEGORY = {
+    'financial': ['3월과 4월 매출 비교해줘', '최근 매출 추이 알려줘', '이익률이 가장 높은 달은?'],
+    'production': ['4월 생산량 알려줘', '생산량이 가장 많은 제품은?', 'A-100 모델 생산 현황'],
+    'purchase': ['이번 달 구매 발주 현황 알려줘', '완료된 발주 목록 보여줘', '글로벌부품 발주 내역 알려줘'],
+    'quality': ['불량의 주요 원인은?', '품질 합격률 알려줘', '외관 불량 현황 보여줘'],
+    'hr': ['부서별 출근율 알려줘', '우리 부서 현황 알려줘', '이번 달 입사/퇴사 현황 알려줘'],
+    'comprehensive': ['전체 경영 현황 요약해줘']
+}
+
+
+def generate_department_guide(department, allowed_categories):
+    if not allowed_categories:
+        return None
+
+    lines = [
+        f'# {department} ERP 사용 가이드 (자동 생성)',
+        '',
+        f'이 문서는 {department}의 조회 권한을 기준으로 자동 생성되었습니다. '
+        '아래 예시처럼 챗봇에 자유롭게 질문하면 됩니다.',
+        ''
+    ]
+
+    lines.append('## 조회 가능한 데이터 및 예시 질문')
+    lines.append('')
+    for category in sorted(allowed_categories):
+        # quality_cause는 별도 업무 영역이 아니라 '품질' 질문 중 원인분석 표현을 쓸 때
+        # 자동으로 걸리는 하위 개념이라, 가이드에서는 품질 섹션 하나로 충분하다.
+        if category == 'quality_cause':
+            continue
+        label = DOMAIN_LABELS.get(category, '종합 현황' if category == 'comprehensive' else category)
+        menu = MENU_GUIDE.get(category, '')
+        heading = f'### {label}' + (f' ({menu})' if menu else '')
+        lines.append(heading)
+        for q in EXAMPLE_QUERIES_BY_CATEGORY.get(category, []):
+            lines.append(f'- "{q}"')
+        lines.append('')
+
+    manual_docs = [
+        d for d in load_knowledge_documents()
+        if not d['title'].startswith('자동생성') and not d['title'].endswith('_가이드')
+    ]
+    if manual_docs:
+        lines.append('## 참고 가능한 사내 규정 문서')
+        lines.append('아래 문서 관련 내용은 규정을 그대로 질문해도 답변받을 수 있습니다.')
+        for d in manual_docs:
+            lines.append(f"- {d['title']}")
+        lines.append('')
+
+    path = os.path.join(KNOWLEDGE_DIR, f'{department}_가이드.md')
+    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    return path
+
+
 # ---------- 오타 보정 (레벤슈타인 유사도) ----------
 # 각 카테고리 키워드 목록 자체가 유사어 사전 역할을 하고,
 # 여기에 오타까지 허용하기 위해 단어 단위 유사도 매칭을 함께 사용한다.
@@ -503,6 +562,9 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
 
     stats_type = extract_stats_type(query)
     is_cause_analysis = contains_keyword(query, ['원인', '이유', '왜'])
+    # "어떻게 해야 돼", "무슨 절차야" 같은 절차 질문은 RAG 문서를 근거로 답할 때
+    # 산문이 아니라 번호 매긴 체크리스트로 정리해서 답하도록 유도한다.
+    is_procedural = contains_keyword(query, ['어떻게', '방법', '절차', '체크리스트', '준비물', '하려면', '순서'])
 
     result = None
 
@@ -537,11 +599,19 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
             context_text = '\n\n'.join(
                 f"[{doc['title']}]\n{doc['content']}" for doc in knowledge_hits
             )
-            prompt = (
-                '다음은 사내 규정/매뉴얼 문서입니다. 이 내용을 근거로 사용자 질문에 답변하세요. '
-                '문서에 없는 내용은 추측하지 말고 모른다고 답하세요.\n\n'
-                f'{context_text}\n\n사용자 질문: {user_query}'
-            )
+            if is_procedural:
+                instruction = (
+                    '다음은 사내 규정/매뉴얼 문서입니다. 이 내용을 근거로, 사용자가 지금 처리해야 할 업무를 '
+                    '번호를 매긴 체크리스트 형태로(1. 2. 3. ...) 정리해서 답변하세요. 각 단계는 한 줄로 '
+                    '간결하게 쓰고, 필요하면 단계별로 담당 부서나 기한도 함께 표시하세요. '
+                    '문서에 없는 내용은 추측하지 말고 모른다고 답하세요.'
+                )
+            else:
+                instruction = (
+                    '다음은 사내 규정/매뉴얼 문서입니다. 이 내용을 근거로 사용자 질문에 답변하세요. '
+                    '문서에 없는 내용은 추측하지 말고 모른다고 답하세요.'
+                )
+            prompt = f'{instruction}\n\n{context_text}\n\n사용자 질문: {user_query}'
             ai_answer = call_potens_ai(prompt)
             sources = ', '.join(doc['title'] for doc in knowledge_hits)
             return {
@@ -1446,6 +1516,17 @@ def generate_faq_route():
     if not path:
         return jsonify({'ok': False, 'message': '아직 반복 질의가 충분히 쌓이지 않았습니다 (동일 질문 2회 이상 필요).'})
     return jsonify({'ok': True, 'message': 'FAQ 문서를 생성해 사내 지식 문서(knowledge)에 반영했습니다.'})
+
+
+@app.route('/api/generate-department-guide', methods=['POST'])
+@login_required
+def generate_department_guide_route():
+    department = session['department']
+    allowed = get_allowed_categories(department, session['role'])
+    path = generate_department_guide(department, allowed)
+    if not path:
+        return jsonify({'ok': False, 'message': '조회 권한이 없어 가이드를 생성할 수 없습니다.'})
+    return jsonify({'ok': True, 'message': f'{department} ERP 가이드를 생성해 사내 지식 문서(knowledge)에 반영했습니다.'})
 
 
 # ---------- 응답 CSV 내보내기 ----------

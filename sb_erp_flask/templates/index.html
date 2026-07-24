@@ -380,6 +380,8 @@
           <div class="popover" id="notifPanel"></div>
         </div>
 
+        <button class="ghost-row" onclick="generateDepartmentGuide()" type="button">📘 우리 부서 가이드 생성</button>
+
         {% if role == 'admin' %}
         <button class="ghost-row" onclick="generateFaq()" type="button">📚 FAQ 자동생성</button>
         {% endif %}
@@ -851,6 +853,14 @@
           .then(function (res) { return res.json(); })
           .then(function (data) { alert(data.message); })
           .catch(function () { alert('FAQ 생성에 실패했습니다.'); });
+      };
+
+      /* ---------- 부서별 ERP 가이드 자동생성 ---------- */
+      window.generateDepartmentGuide = function () {
+        fetch('/api/generate-department-guide', { method: 'POST' })
+          .then(function (res) { return res.json(); })
+          .then(function (data) { alert(data.message); })
+          .catch(function () { alert('가이드 생성에 실패했습니다.'); });
       };
 
       /* ---------- 유틸 ---------- */
