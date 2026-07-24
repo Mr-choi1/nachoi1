@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 sb_erp_flask/users.db
+sb_erp_flask/erp_data.db
+sb_erp_flask/data/
 sb_erp_flask/knowledge/자동생성_FAQ.md
 sb_erp_flask/knowledge/*_가이드.md
 .env

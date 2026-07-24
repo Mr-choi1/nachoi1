@@ -606,7 +606,12 @@
               else if (response.data.products && response.data.products.length) renderProductionChart(response.data.products, uid);
             }, 50);
             break;
-          case 'purchase': slot.innerHTML = renderPurchaseData(response.data); break;
+          case 'purchase':
+            slot.innerHTML = renderPurchaseData(response.data, uid);
+            setTimeout(function () {
+              if (response.data.monthly && response.data.monthly.length) renderPurchaseChart(response.data.monthly, uid);
+            }, 50);
+            break;
           case 'quality': slot.innerHTML = renderQualityData(response.data, uid); setTimeout(function () { renderQualityChart(response.data.defectTypes, uid); }, 50); break;
           case 'quality_cause': slot.innerHTML = renderQualityCauseData(response.data, uid); setTimeout(function () { renderCauseChart(response.data.causeAnalysis && response.data.causeAnalysis.causes, uid); }, 50); break;
           case 'hr': slot.innerHTML = renderHRData(response.data, uid); setTimeout(function () { renderHRChart(response.data.departments, uid); }, 50); break;
@@ -956,20 +961,31 @@
 
     /* ================= 결과 렌더링 (표/카드) ================= */
     function renderFinancialData(data, uid) {
+      if (data.noData) {
+        return '<div class="sidebar-empty" style="margin:12px 0;">아직 매출 실데이터가 적재되지 않았습니다.</div>';
+      }
       var html = '<div class="summary-cards">' +
-        '<div class="summary-card"><h3>총 매출</h3><div class="value">' + formatNumber(data.summary.totalRevenue) + '원</div></div>' +
-        '<div class="summary-card"><h3>총 비용</h3><div class="value">' + formatNumber(data.summary.totalExpense) + '원</div></div>' +
-        '<div class="summary-card"><h3>순이익</h3><div class="value">' + formatNumber(data.summary.netProfit) + '원</div></div>' +
-        '<div class="summary-card"><h3>수익률</h3><div class="value">' + data.summary.profitRate + '%</div></div>' +
+        '<div class="summary-card"><h3>누적 매출</h3><div class="value">' + formatNumber(data.summary.totalRevenue) + '원</div></div>' +
+        '<div class="summary-card"><h3>거래 건수</h3><div class="value">' + formatNumber(data.summary.dealCount) + '건</div></div>' +
+        '<div class="summary-card"><h3>고객사 수</h3><div class="value">' + data.summary.customerCount + '개</div></div>' +
         '</div>';
 
       if (data.monthly && data.monthly.length > 0) {
-        html += '<div class="table-wrap"><table><thead><tr><th>월</th><th>매출</th><th>비용</th><th>이익</th></tr></thead><tbody>';
+        html += '<div class="table-wrap"><table><thead><tr><th>월</th><th>매출</th><th>거래건수</th></tr></thead><tbody>';
         data.monthly.forEach(function (row) {
-          html += '<tr><td>' + row.month + '</td><td>' + formatNumber(row.revenue) + '원</td><td>' + formatNumber(row.expense) + '원</td><td>' + formatNumber(row.profit) + '원</td></tr>';
+          html += '<tr><td>' + row.month + '</td><td>' + formatNumber(row.revenue) + '원</td><td>' + formatNumber(row.dealCount) + '건</td></tr>';
         });
         html += '</tbody></table></div>';
         html += '<div class="chart-container"><canvas id="' + uid + '-financialChart"></canvas></div>';
+      }
+
+      if (data.topCustomers && data.topCustomers.length > 0) {
+        html += '<h4 style="margin:14px 0 6px; color:var(--text);">상위 고객사</h4>';
+        html += '<div class="table-wrap"><table><thead><tr><th>고객사</th><th>매출</th><th>거래건수</th></tr></thead><tbody>';
+        data.topCustomers.forEach(function (row) {
+          html += '<tr><td>' + row.customer + '</td><td>' + formatNumber(row.amount) + '원</td><td>' + formatNumber(row.dealCount) + '건</td></tr>';
+        });
+        html += '</tbody></table></div>';
       }
       return html;
     }
@@ -999,17 +1015,42 @@
       return html;
     }
 
-    function renderPurchaseData(data) {
+    function renderPurchaseData(data, uid) {
+      if (data.noData) {
+        return '<div class="sidebar-empty" style="margin:12px 0;">아직 외주인건비 실데이터가 적재되지 않았습니다.</div>';
+      }
       var html = '<div class="summary-cards">' +
-        '<div class="summary-card"><h3>총 발주 건수</h3><div class="value">' + data.summary.totalOrders + '건</div></div>' +
-        '<div class="summary-card"><h3>총 발주 금액</h3><div class="value">' + formatNumber(data.summary.totalAmount) + '원</div></div>' +
-        '<div class="summary-card"><h3>대기 중</h3><div class="value">' + data.summary.pendingOrders + '건</div></div>' +
+        '<div class="summary-card"><h3>누적 외주비</h3><div class="value">' + formatNumber(data.summary.totalAmount) + '원</div></div>' +
+        '<div class="summary-card"><h3>청구 건수</h3><div class="value">' + formatNumber(data.summary.totalOrders) + '건</div></div>' +
+        '<div class="summary-card"><h3>외주업체 수</h3><div class="value">' + data.summary.supplierCount + '곳</div></div>' +
         '</div>';
-      html += '<div class="table-wrap"><table><thead><tr><th>공급업체</th><th>품목</th><th>금액</th><th>상태</th></tr></thead><tbody>';
-      data.orders.forEach(function (row) {
-        html += '<tr><td>' + row.supplier + '</td><td>' + row.item + '</td><td>' + formatNumber(row.amount) + '원</td><td>' + row.status + '</td></tr>';
-      });
-      html += '</tbody></table></div>';
+
+      if (data.monthly && data.monthly.length > 0) {
+        html += '<div class="table-wrap"><table><thead><tr><th>월</th><th>금액</th><th>건수</th></tr></thead><tbody>';
+        data.monthly.forEach(function (row) {
+          html += '<tr><td>' + row.month + '</td><td>' + formatNumber(row.amount) + '원</td><td>' + formatNumber(row.orderCount) + '건</td></tr>';
+        });
+        html += '</tbody></table></div>';
+        html += '<div class="chart-container"><canvas id="' + uid + '-purchaseChart"></canvas></div>';
+      }
+
+      if (data.topSuppliers && data.topSuppliers.length > 0) {
+        html += '<h4 style="margin:14px 0 6px; color:var(--text);">상위 외주업체</h4>';
+        html += '<div class="table-wrap"><table><thead><tr><th>업체명</th><th>금액</th><th>건수</th></tr></thead><tbody>';
+        data.topSuppliers.forEach(function (row) {
+          html += '<tr><td>' + row.work_team + '</td><td>' + formatNumber(row.amount) + '원</td><td>' + formatNumber(row.orderCount) + '건</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+
+      if (data.orders && data.orders.length > 0) {
+        html += '<h4 style="margin:14px 0 6px; color:var(--text);">최근 청구 내역</h4>';
+        html += '<div class="table-wrap"><table><thead><tr><th>외주업체</th><th>내역</th><th>금액</th><th>구분</th></tr></thead><tbody>';
+        data.orders.slice(0, 15).forEach(function (row) {
+          html += '<tr><td>' + row.supplier + '</td><td>' + (row.item || '') + '</td><td>' + formatNumber(row.amount) + '원</td><td>' + (row.status || '') + '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      }
       return html;
     }
 
@@ -1081,16 +1122,43 @@
       var ctx = document.getElementById(uid + '-financialChart');
       if (!ctx || !data) return;
       new Chart(ctx, {
-        type: 'bar',
         data: {
           labels: data.map(function (d) { return d.month; }),
           datasets: [
-            { label: '매출', data: data.map(function (d) { return d.revenue; }), backgroundColor: 'rgba(30, 144, 255, 0.7)' },
-            { label: '비용', data: data.map(function (d) { return d.expense; }), backgroundColor: 'rgba(255, 99, 132, 0.7)' },
-            { label: '이익', data: data.map(function (d) { return d.profit; }), backgroundColor: 'rgba(0, 206, 209, 0.7)' }
+            { type: 'bar', label: '매출', data: data.map(function (d) { return d.revenue; }), backgroundColor: 'rgba(30, 144, 255, 0.7)', yAxisID: 'y' },
+            { type: 'line', label: '거래 건수', data: data.map(function (d) { return d.dealCount; }), borderColor: 'rgba(0,206,209,1)', backgroundColor: 'rgba(0,206,209,0.2)', yAxisID: 'y1', tension: 0.3 }
           ]
         },
-        options: { responsive: true, maintainAspectRatio: true, plugins: { title: { display: true, text: '월별 재무 현황' } } }
+        options: {
+          responsive: true, maintainAspectRatio: true,
+          plugins: { title: { display: true, text: '월별 매출 추이' } },
+          scales: {
+            y: { type: 'linear', position: 'left', title: { display: true, text: '매출(원)' } },
+            y1: { type: 'linear', position: 'right', title: { display: true, text: '거래 건수' }, grid: { drawOnChartArea: false } }
+          }
+        }
+      });
+    }
+
+    function renderPurchaseChart(data, uid) {
+      var ctx = document.getElementById(uid + '-purchaseChart');
+      if (!ctx || !data) return;
+      new Chart(ctx, {
+        data: {
+          labels: data.map(function (d) { return d.month; }),
+          datasets: [
+            { type: 'bar', label: '외주비', data: data.map(function (d) { return d.amount; }), backgroundColor: 'rgba(255, 159, 64, 0.7)', yAxisID: 'y' },
+            { type: 'line', label: '건수', data: data.map(function (d) { return d.orderCount; }), borderColor: 'rgba(153,102,255,1)', backgroundColor: 'rgba(153,102,255,0.2)', yAxisID: 'y1', tension: 0.3 }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: true,
+          plugins: { title: { display: true, text: '월별 외주인건비 추이' } },
+          scales: {
+            y: { type: 'linear', position: 'left', title: { display: true, text: '금액(원)' } },
+            y1: { type: 'linear', position: 'right', title: { display: true, text: '건수' }, grid: { drawOnChartArea: false } }
+          }
+        }
       });
     }
 

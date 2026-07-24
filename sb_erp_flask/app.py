@@ -659,7 +659,7 @@ def process_ai_query(user_query, allowed_categories=None, department=None, last_
         result = handle_financial_query(query, period, is_comparison, specific_item, stats_type)
     elif contains_keyword(query, ['생산', '제품', '생산량', '공장']):
         result = handle_production_query(query, period, is_comparison, specific_item, stats_type)
-    elif contains_keyword(query, ['구매', '발주', '자재', '공급']):
+    elif contains_keyword(query, ['구매', '발주', '자재', '공급', '외주', '외주비', '외주인건비', '기성', '작업팀']):
         result = handle_purchase_query(query, period, is_comparison, specific_item, stats_type)
     elif contains_keyword(query, ['품질', '불량', '검사', '합격']):
         result = handle_quality_query(query, period, is_comparison, specific_item, stats_type, is_cause_analysis)
@@ -801,6 +801,18 @@ def enrich_structured_response(result):
 
 # ---------- 기간 추출 ----------
 def extract_period(query):
+    # 실데이터(재무/구매)는 여러 해에 걸쳐 있어 "3월"만으로는 어느 해인지 알 수
+    # 없다. "2024년 3월", "2024-03", "24년 3월" 같은 명시적 연-월은 먼저
+    # specific_ym으로 인식해 정확한 달만 짚어낸다.
+    year_month_match = re.search(r'(20\d{2}|\d{2})[년\-.]\s*(\d{1,2})월?', query)
+    if year_month_match:
+        year = year_month_match.group(1)
+        if len(year) == 2:
+            year = '20' + year
+        month = int(year_month_match.group(2))
+        if 1 <= month <= 12:
+            return {'type': 'specific_ym', 'value': [f'{year}-{month:02d}']}
+
     months = ['1월', '2월', '3월', '4월', '5월', '6월', '7월', '8월', '9월', '10월', '11월', '12월']
     found_months = [m for m in months if m in query]
 
@@ -815,7 +827,14 @@ def extract_period(query):
 
 
 # ---------- 특정 항목 추출 ----------
+PLANT_NAMES = ['다대1공장', '다대2공장', '영암공장', '김해공장', '구평공장']
+
+
 def extract_specific_item(query):
+    for plant in PLANT_NAMES:
+        if plant in query:
+            return plant
+
     if 'a-100' in query or 'a100' in query:
         return 'A-100 모델'
     if 'b-200' in query or 'b200' in query:
@@ -880,15 +899,31 @@ def extract_stats_type(query):
 
 
 # ---------- 재무 질문 처리 ----------
+MONTH_NAME_TO_NUM = {f'{i}월': f'{i:02d}' for i in range(1, 13)}
+
+
 def handle_financial_query(query, period, is_comparison, specific_item, stats_type):
-    data = get_financial_data()
+    data = get_financial_data(months=24)
     message = ''
     processed_data = copy.deepcopy(data)
 
+    if data.get('noData'):
+        return {
+            'type': 'financial',
+            'data': processed_data,
+            'message': '⚠️ 매출 실데이터가 아직 적재되지 않았습니다. (관리자에게 문의: import_real_data.py 실행 필요)',
+            'query': query
+        }
+
     period_label = None
-    if period['type'] == 'specific' and period['value']:
+    if period['type'] == 'specific_ym' and period['value']:
         processed_data['monthly'] = [m for m in data['monthly'] if m['month'] in period['value']]
         period_label = ', '.join(period['value'])
+    elif period['type'] == 'specific' and period['value']:
+        # "3월"처럼 연도 없이 말하면 보유한 모든 연도의 3월을 함께 보여준다.
+        month_nums = {MONTH_NAME_TO_NUM[m] for m in period['value'] if m in MONTH_NAME_TO_NUM}
+        processed_data['monthly'] = [m for m in data['monthly'] if m['month'][5:7] in month_nums]
+        period_label = ', '.join(period['value']) + ' (연도 미지정 · 전체 연도)'
     elif period['type'] == 'recent':
         processed_data['monthly'] = data['monthly'][-3:]
         period_label = f"최근 {len(processed_data['monthly'])}개월(" + ', '.join(m['month'] for m in processed_data['monthly']) + ")"
@@ -897,72 +932,69 @@ def handle_financial_query(query, period, is_comparison, specific_item, stats_ty
         period_label = f"지난달({processed_data['monthly'][0]['month']})"
 
     if period_label:
-        message += f"📅 {period_label} 재무 데이터:\n\n"
-
+        message += f"📅 {period_label} 매출 데이터:\n\n"
         for m in processed_data['monthly']:
-            message += f"[{m['month']}]\n"
-            message += f"💰 매출: {format_number(m['revenue'])}원\n"
-            message += f"💸 비용: {format_number(m['expense'])}원\n"
-            message += f"📈 이익: {format_number(m['profit'])}원\n"
-            message += f"📊 수익률: {(m['profit'] / m['revenue'] * 100):.1f}%\n\n"
+            message += f"[{m['month']}] 매출 {format_number(m['revenue'])}원 · 거래 {format_number(m['dealCount'])}건\n"
+        message += '\n'
 
     if is_comparison and len(processed_data['monthly']) >= 2:
         first = processed_data['monthly'][0]
         last = processed_data['monthly'][-1]
         revenue_diff = last['revenue'] - first['revenue']
-        profit_diff = last['profit'] - first['profit']
 
         message += f"\n📊 비교 분석 ({first['month']} vs {last['month']}):\n"
-        message += f"- 매출 변화: {format_number(abs(revenue_diff))}원 {'📈 증가' if revenue_diff > 0 else '📉 감소'} ({(revenue_diff / first['revenue'] * 100):.1f}%)\n"
-        message += f"- 이익 변화: {format_number(abs(profit_diff))}원 {'📈 증가' if profit_diff > 0 else '📉 감소'} ({(profit_diff / first['profit'] * 100):.1f}%)\n"
+        message += f"- 매출 변화: {format_number(abs(revenue_diff))}원 {'📈 증가' if revenue_diff > 0 else '📉 감소'}"
+        if first['revenue']:
+            message += f" ({(revenue_diff / first['revenue'] * 100):.1f}%)"
+        message += '\n'
 
-        processed_data['comparison'] = {
-            'revenueDiff': revenue_diff,
-            'profitDiff': profit_diff,
-            'revenuePercent': round(revenue_diff / first['revenue'] * 100, 2),
-            'profitPercent': round(profit_diff / first['profit'] * 100, 2)
-        }
+        processed_data['comparison'] = {'revenueDiff': revenue_diff}
 
-    if stats_type:
-        revenues = [m['revenue'] for m in processed_data['monthly']]
-        profits = [m['profit'] for m in processed_data['monthly']]
+    stats_source = processed_data['monthly'] or data['monthly']
+    if stats_type and stats_source:
+        revenues = [m['revenue'] for m in stats_source]
 
         if stats_type == 'average':
             avg_revenue = sum(revenues) / len(revenues)
-            avg_profit = sum(profits) / len(profits)
-            message += f"\n📈 평균 데이터:\n"
-            message += f"- 평균 매출: {format_number(round(avg_revenue))}원\n"
-            message += f"- 평균 이익: {format_number(round(avg_profit))}원\n"
-            processed_data['stats'] = {'avgRevenue': avg_revenue, 'avgProfit': avg_profit}
+            message += f"\n📈 평균 매출: {format_number(round(avg_revenue))}원\n"
 
         elif stats_type == 'max':
             max_revenue = max(revenues)
-            max_revenue_month = next(m for m in processed_data['monthly'] if m['revenue'] == max_revenue)
-            message += f"\n🔝 최대 매출:\n"
-            message += f"- {max_revenue_month['month']}: {format_number(max_revenue)}원\n"
-            processed_data['highlight'] = max_revenue_month
+            max_month = next(m for m in stats_source if m['revenue'] == max_revenue)
+            message += f"\n🔝 최대 매출: {max_month['month']} — {format_number(max_revenue)}원\n"
+            processed_data['highlight'] = max_month
 
         elif stats_type == 'min':
             min_revenue = min(revenues)
-            min_revenue_month = next(m for m in processed_data['monthly'] if m['revenue'] == min_revenue)
-            message += f"\n📉 최소 매출:\n"
-            message += f"- {min_revenue_month['month']}: {format_number(min_revenue)}원\n"
-            processed_data['highlight'] = min_revenue_month
+            min_month = next(m for m in stats_source if m['revenue'] == min_revenue)
+            message += f"\n📉 최소 매출: {min_month['month']} — {format_number(min_revenue)}원\n"
+            processed_data['highlight'] = min_month
 
         elif stats_type == 'sum':
-            total_revenue = sum(revenues)
-            total_profit = sum(profits)
-            message += f"\n💰 총합:\n"
-            message += f"- 총 매출: {format_number(total_revenue)}원\n"
-            message += f"- 총 이익: {format_number(total_profit)}원\n"
+            message += f"\n💰 합계 매출: {format_number(sum(revenues))}원\n"
 
-        elif stats_type == 'trend':
+        elif stats_type == 'trend' and len(revenues) >= 2:
             is_increasing = revenues[-1] > revenues[0]
-            message += f"\n📊 추세 분석:\n"
-            message += f"- 전반적으로 {'📈 증가' if is_increasing else '📉 감소'} 추세입니다.\n"
+            message += f"\n📊 추세: 전반적으로 {'📈 증가' if is_increasing else '📉 감소'} 추세입니다.\n"
+
+    if specific_item and specific_item in PLANT_NAMES:
+        conn = get_erp_data_db()
+        row = conn.execute(
+            'SELECT SUM(amount) AS amount, COUNT(*) AS cnt FROM sales_records WHERE plant = ?', (specific_item,)
+        ).fetchone()
+        conn.close()
+        if row and row['cnt']:
+            message += f"\n🏭 {specific_item} 매출: {format_number(row['amount'])}원 ({row['cnt']}건)\n"
+            processed_data['plantDetail'] = {'plant': specific_item, 'amount': row['amount'], 'count': row['cnt']}
 
     if not message:
-        message = '재무 현황을 조회했습니다.'
+        s = data['summary']
+        top = ', '.join(f"{c['customer']}({format_number(c['amount'])}원)" for c in data['topCustomers'][:3])
+        message = (
+            f"💰 누적 매출: {format_number(s['totalRevenue'])}원 "
+            f"({format_number(s['dealCount'])}건, 고객사 {s['customerCount']}개)\n"
+            f"🏆 상위 고객사: {top}"
+        )
 
     return {
         'type': 'financial',
@@ -1070,54 +1102,100 @@ def handle_production_query(query, period, is_comparison, specific_item, stats_t
 
 
 # ---------- 구매 질문 처리 ----------
+def find_matching_work_team(query):
+    # 141개 외주업체명을 매번 하드코딩할 수 없어 DB에서 실제 업체명 목록을
+    # 가져와 질문 문장에 포함되는지 직접 대조한다.
+    conn = get_erp_data_db()
+    if conn is None:
+        return None
+    teams = [row[0] for row in conn.execute(
+        'SELECT DISTINCT work_team FROM outsourcing_costs WHERE work_team IS NOT NULL'
+    )]
+    conn.close()
+    for team in teams:
+        if team and team in query:
+            return team
+    return None
+
+
 def handle_purchase_query(query, period, is_comparison, specific_item, stats_type):
-    data = get_purchase_data()
+    data = get_purchase_data(months=24)
     message = ''
     processed_data = copy.deepcopy(data)
 
-    if specific_item:
-        processed_data['orders'] = [o for o in processed_data['orders'] if specific_item in o['supplier']]
-        if processed_data['orders']:
-            total = sum(o['amount'] for o in processed_data['orders'])
-            message += f"🏢 {specific_item} 발주 내역 ({len(processed_data['orders'])}건, 총 {format_number(total)}원):\n\n"
-            for o in processed_data['orders']:
-                message += f"- {o['item']}: {format_number(o['amount'])}원 ({o['status']})\n"
-            message += "\n"
-        else:
-            message += f"🏢 {specific_item} 관련 발주 내역이 없습니다.\n\n"
+    if data.get('noData'):
+        return {
+            'type': 'purchase',
+            'data': processed_data,
+            'message': '⚠️ 외주인건비 실데이터가 아직 적재되지 않았습니다. (관리자에게 문의: import_real_data.py 실행 필요)',
+            'query': query
+        }
 
-    if '완료' in query:
-        processed_data['orders'] = [o for o in processed_data['orders'] if o['status'] == '완료']
-        message += f"✅ 완료된 발주: {len(processed_data['orders'])}건\n\n"
-    elif '진행' in query or '대기' in query:
-        processed_data['orders'] = [o for o in processed_data['orders'] if o['status'] != '완료']
-        message += f"⏳ 진행중/대기 발주: {len(processed_data['orders'])}건\n\n"
+    period_label = None
+    if period['type'] == 'specific_ym' and period['value']:
+        ym_values = {v.replace('-', '') for v in period['value']}
+        processed_data['monthly'] = [m for m in data['monthly'] if m['month'] in ym_values]
+        period_label = ', '.join(period['value'])
+    elif period['type'] == 'specific' and period['value']:
+        month_nums = {MONTH_NAME_TO_NUM[m] for m in period['value'] if m in MONTH_NAME_TO_NUM}
+        processed_data['monthly'] = [m for m in data['monthly'] if m['month'][4:6] in month_nums]
+        period_label = ', '.join(period['value']) + ' (연도 미지정 · 전체 연도)'
+    elif period['type'] == 'recent':
+        processed_data['monthly'] = data['monthly'][-3:]
+        period_label = f"최근 {len(processed_data['monthly'])}개월"
+    elif period['type'] == 'past' and len(data['monthly']) >= 2:
+        processed_data['monthly'] = [data['monthly'][-2]]
+        period_label = f"지난달({processed_data['monthly'][0]['month']})"
 
-    if stats_type and processed_data['orders']:
-        amounts = [o['amount'] for o in processed_data['orders']]
+    if period_label:
+        message += f"📅 {period_label} 외주인건비 데이터:\n\n"
+        for m in processed_data['monthly']:
+            message += f"[{m['month']}] 금액 {format_number(m['amount'])}원 · 건수 {format_number(m['orderCount'])}건\n"
+        message += '\n'
+
+    supplier = find_matching_work_team(query)
+    if supplier:
+        conn = get_erp_data_db()
+        row = conn.execute(
+            'SELECT SUM(billing_amount) AS amount, COUNT(*) AS cnt FROM outsourcing_costs WHERE work_team = ?',
+            (supplier,)
+        ).fetchone()
+        conn.close()
+        message += f"🏢 {supplier} 외주비: {format_number(row['amount'])}원 ({row['cnt']}건)\n\n"
+        processed_data['supplierDetail'] = {'supplier': supplier, 'amount': row['amount'], 'count': row['cnt']}
+        processed_data['orders'] = [o for o in processed_data['orders'] if o['supplier'] == supplier]
+
+    if '확정' in query or '완료' in query:
+        processed_data['orders'] = [o for o in processed_data['orders'] if '확정' in (o['status'] or '')]
+        message += f"✅ 확정된 기성: {len(processed_data['orders'])}건\n\n"
+    elif '가결산' in query or '진행' in query or '대기' in query:
+        processed_data['orders'] = [o for o in processed_data['orders'] if '확정' not in (o['status'] or '')]
+        message += f"⏳ 가결산/진행중 기성: {len(processed_data['orders'])}건\n\n"
+
+    stats_source = processed_data['monthly'] or data['monthly']
+    if stats_type and stats_source:
+        amounts = [m['amount'] for m in stats_source]
 
         if stats_type == 'max':
             max_amount = max(amounts)
-            max_order = next(o for o in processed_data['orders'] if o['amount'] == max_amount)
-            message += f"\n💰 최대 발주:\n"
-            message += f"- 공급업체: {max_order['supplier']}\n"
-            message += f"- 품목: {max_order['item']}\n"
-            message += f"- 금액: {format_number(max_amount)}원\n"
-            message += f"- 상태: {max_order['status']}\n"
-            processed_data['highlight'] = max_order
+            max_month = next(m for m in stats_source if m['amount'] == max_amount)
+            message += f"\n💰 최대 외주비 달: {max_month['month']} — {format_number(max_amount)}원\n"
+            processed_data['highlight'] = max_month
 
         elif stats_type == 'sum':
-            total_amount = sum(amounts)
-            message += f"\n📊 총 발주 금액: {format_number(total_amount)}원\n"
-            message += f"- 발주 건수: {len(processed_data['orders'])}건\n"
-            message += f"- 평균 발주액: {format_number(round(total_amount / len(processed_data['orders'])))}원\n"
+            message += f"\n📊 합계 외주비: {format_number(sum(amounts))}원\n"
 
         elif stats_type == 'average':
-            avg_amount = sum(amounts) / len(amounts)
-            message += f"\n📊 평균 발주 금액: {format_number(round(avg_amount))}원\n"
+            message += f"\n📊 평균 외주비: {format_number(round(sum(amounts) / len(amounts)))}원\n"
 
     if not message:
-        message = '구매 현황을 조회했습니다.'
+        s = data['summary']
+        top = ', '.join(f"{sup['work_team']}({format_number(sup['amount'])}원)" for sup in data['topSuppliers'][:3])
+        message = (
+            f"🏢 누적 외주인건비: {format_number(s['totalAmount'])}원 "
+            f"({format_number(s['totalOrders'])}건, 업체 {s['supplierCount']}곳)\n"
+            f"🏆 상위 외주업체: {top}"
+        )
 
     return {
         'type': 'purchase',
@@ -1456,22 +1534,57 @@ def format_number(num):
 
 
 # ---------- 재무 데이터 ----------
-def get_financial_data():
+ERP_DATA_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'erp_data.db')
+
+
+def get_erp_data_db():
+    # 실데이터(erp_data.db)는 import_real_data.py로 별도 적재해야 생긴다.
+    # 아직 적재 전이거나(예: 팀원이 데이터 파일 없이 클론) 없으면 None을 반환해
+    # 호출부에서 "데이터 없음"으로 우아하게 처리하도록 한다.
+    if not os.path.exists(ERP_DATA_DB_PATH):
+        return None
+    conn = sqlite3.connect(ERP_DATA_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_financial_data(months=12):
+    conn = get_erp_data_db()
+    if conn is None:
+        return {'summary': {}, 'monthly': [], 'topCustomers': [], 'byPlant': [], 'noData': True}
+
+    summary = conn.execute('''
+        SELECT SUM(amount) AS totalRevenue, COUNT(*) AS dealCount,
+               COUNT(DISTINCT customer) AS customerCount
+        FROM sales_records
+    ''').fetchone()
+
+    monthly_rows = conn.execute('''
+        SELECT substr(sales_date, 1, 7) AS month, SUM(amount) AS revenue, COUNT(*) AS dealCount
+        FROM sales_records WHERE sales_date IS NOT NULL
+        GROUP BY month ORDER BY month DESC LIMIT ?
+    ''', (months,)).fetchall()
+
+    top_customers = conn.execute('''
+        SELECT customer, SUM(amount) AS amount, COUNT(*) AS dealCount
+        FROM sales_records GROUP BY customer ORDER BY amount DESC LIMIT 5
+    ''').fetchall()
+
+    by_plant = conn.execute('''
+        SELECT plant, SUM(amount) AS amount FROM sales_records
+        GROUP BY plant ORDER BY amount DESC
+    ''').fetchall()
+
+    conn.close()
     return {
         'summary': {
-            'totalRevenue': 15800000000,
-            'totalExpense': 12300000000,
-            'netProfit': 3500000000,
-            'profitRate': 22.15
+            'totalRevenue': summary['totalRevenue'] or 0,
+            'dealCount': summary['dealCount'] or 0,
+            'customerCount': summary['customerCount'] or 0
         },
-        'monthly': [
-            {'month': '1월', 'revenue': 1200000000, 'expense': 950000000, 'profit': 250000000},
-            {'month': '2월', 'revenue': 1350000000, 'expense': 1050000000, 'profit': 300000000},
-            {'month': '3월', 'revenue': 1280000000, 'expense': 1020000000, 'profit': 260000000},
-            {'month': '4월', 'revenue': 1420000000, 'expense': 1100000000, 'profit': 320000000},
-            {'month': '5월', 'revenue': 1380000000, 'expense': 1080000000, 'profit': 300000000},
-            {'month': '6월', 'revenue': 1470000000, 'expense': 1150000000, 'profit': 320000000}
-        ]
+        'monthly': [dict(r) for r in reversed(monthly_rows)],
+        'topCustomers': [dict(r) for r in top_customers],
+        'byPlant': [dict(r) for r in by_plant]
     }
 
 
@@ -1508,20 +1621,47 @@ def get_production_data():
 
 
 # ---------- 구매 데이터 ----------
-def get_purchase_data():
+def get_purchase_data(months=12):
+    # '구매' 도메인은 실데이터 중 외주인건비(외주업체에 지급하는 기성금액)로 매핑.
+    conn = get_erp_data_db()
+    if conn is None:
+        return {'summary': {}, 'orders': [], 'topSuppliers': [], 'monthly': [], 'noData': True}
+
+    summary = conn.execute('''
+        SELECT SUM(billing_amount) AS totalAmount, COUNT(*) AS totalOrders,
+               COUNT(DISTINCT work_team) AS supplierCount
+        FROM outsourcing_costs
+    ''').fetchone()
+
+    # 기존 UI의 '발주 내역' 표에 대응 — 최근 청구 건 상위 목록
+    recent_orders = conn.execute('''
+        SELECT work_team AS supplier, billing_detail AS item, billing_amount AS amount,
+               billing_type AS status
+        FROM outsourcing_costs
+        ORDER BY year_month DESC, id DESC LIMIT 30
+    ''').fetchall()
+
+    top_suppliers = conn.execute('''
+        SELECT work_team, SUM(billing_amount) AS amount, COUNT(*) AS orderCount
+        FROM outsourcing_costs GROUP BY work_team ORDER BY amount DESC LIMIT 5
+    ''').fetchall()
+
+    monthly_rows = conn.execute('''
+        SELECT year_month AS month, SUM(billing_amount) AS amount, COUNT(*) AS orderCount
+        FROM outsourcing_costs WHERE year_month IS NOT NULL
+        GROUP BY month ORDER BY month DESC LIMIT ?
+    ''', (months,)).fetchall()
+
+    conn.close()
     return {
         'summary': {
-            'totalOrders': 245,
-            'totalAmount': 4800000000,
-            'pendingOrders': 18
+            'totalAmount': summary['totalAmount'] or 0,
+            'totalOrders': summary['totalOrders'] or 0,
+            'supplierCount': summary['supplierCount'] or 0
         },
-        'orders': [
-            {'supplier': '(주)대한소재', 'item': '철강 원자재', 'amount': 850000000, 'status': '완료'},
-            {'supplier': '글로벌부품', 'item': '전자부품 세트', 'amount': 620000000, 'status': '진행중'},
-            {'supplier': '한국화학', 'item': '산업용 화학제', 'amount': 450000000, 'status': '완료'},
-            {'supplier': '프리미엄자재', 'item': '특수 합금', 'amount': 720000000, 'status': '대기'},
-            {'supplier': '스마트부품상사', 'item': 'PCB 기판', 'amount': 380000000, 'status': '완료'}
-        ]
+        'orders': [dict(r) for r in recent_orders],
+        'topSuppliers': [dict(r) for r in top_suppliers],
+        'monthly': [dict(r) for r in reversed(monthly_rows)]
     }
 
 
@@ -1709,7 +1849,7 @@ def extract_export_rows(export_type, data):
     if not data:
         return None, None
     if export_type == 'financial' and data.get('monthly'):
-        return ['month', 'revenue', 'expense', 'profit'], data['monthly']
+        return ['month', 'revenue', 'dealCount'], data['monthly']
     if export_type == 'production':
         if data.get('monthly'):
             return ['month', 'totalProduction', 'goodProducts', 'defectProducts', 'defectRate', 'efficiency'], data['monthly']
