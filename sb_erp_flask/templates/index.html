@@ -545,7 +545,9 @@
       }
       function scrollToBottom() { chatScroll.scrollTop = chatScroll.scrollHeight; }
 
-      var EXPORTABLE_TYPES = ['financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr'];
+      // 엑셀은 서버가 표 형태로 구조화할 수 있는 타입만 지원. PDF는 화면을 그대로
+      // 캡처하는 방식이라 데이터가 있는 응답이면(종합 현황 포함) 전부 가능하다.
+      var EXCEL_EXPORTABLE_TYPES = ['financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr'];
 
       function appendAssistantMessage(response) {
         msgCounter += 1;
@@ -559,15 +561,16 @@
 
         if (response.data) {
           html += '<div class="result-slot" id="' + uid + '-slot"></div>';
-          if (EXPORTABLE_TYPES.indexOf(response.type) !== -1) {
-            html += '<div class="msg-actions">' +
-              '<button class="msg-export-btn" onclick="toggleExportMenu(\'' + uid + '\')">⬇ 내보내기</button>' +
-              '<div class="export-format-menu" id="' + uid + '-exportmenu">' +
-              '<button class="export-format-btn" onclick="exportExcel(\'' + uid + '\', this)">📊 엑셀</button>' +
-              '<button class="export-format-btn" onclick="exportPDF(\'' + uid + '\', this)">📄 PDF</button>' +
-              '</div>' +
-              '</div>';
-          }
+          var excelBtn = EXCEL_EXPORTABLE_TYPES.indexOf(response.type) !== -1
+            ? '<button class="export-format-btn" onclick="exportExcel(\'' + uid + '\', this)">📊 엑셀</button>'
+            : '';
+          html += '<div class="msg-actions">' +
+            '<button class="msg-export-btn" onclick="toggleExportMenu(\'' + uid + '\')">⬇ 내보내기</button>' +
+            '<div class="export-format-menu" id="' + uid + '-exportmenu">' +
+            excelBtn +
+            '<button class="export-format-btn" onclick="exportPDF(\'' + uid + '\', this)">📄 PDF</button>' +
+            '</div>' +
+            '</div>';
         }
         html += '</div>';
         row.innerHTML = html;
@@ -734,12 +737,29 @@
 
       /* ---------- 알림 ---------- */
       var lastNotifications = [];
+      var notifToggleBtn = document.getElementById('notifToggle');
       window.toggleNotifications = function () {
         var panel = document.getElementById('notifPanel');
         var isOpen = panel.classList.contains('show');
         panel.classList.toggle('show', !isOpen);
         if (!isOpen) fetchNotifications();
       };
+
+      // 알림 패널/내보내기 메뉴 바깥을 클릭하면 자동으로 닫는다.
+      document.addEventListener('click', function (e) {
+        var notifPanel = document.getElementById('notifPanel');
+        if (notifPanel && notifPanel.classList.contains('show') &&
+            !notifPanel.contains(e.target) && e.target !== notifToggleBtn && !notifToggleBtn.contains(e.target)) {
+          notifPanel.classList.remove('show');
+        }
+
+        document.querySelectorAll('.export-format-menu.show').forEach(function (menu) {
+          var toggleBtn = menu.previousElementSibling;
+          if (!menu.contains(e.target) && e.target !== toggleBtn) {
+            menu.classList.remove('show');
+          }
+        });
+      });
 
       function fetchNotifications() {
         fetch('/api/notifications')

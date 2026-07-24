@@ -1367,12 +1367,18 @@ def get_hr_data():
 def get_category_data_route(category):
     allowed = get_allowed_categories(session['department'], session['role'])
     if category not in allowed:
-        return jsonify({
+        result = {
             'type': 'text',
             'data': None,
             'message': '🔒 소속 부서 권한으로는 조회할 수 없는 데이터입니다. 담당 부서 또는 관리자에게 문의해주세요.'
-        })
-    return jsonify(get_category_data(category))
+        }
+    else:
+        # /api/query와 동일하게 신뢰도 표시·관련 메뉴 안내를 붙이고 조회 이력에도 남긴다
+        # (사이드바 '빠른 조회' 버튼과 채팅 질의가 서로 다른 응답을 주지 않도록 통일).
+        result = enrich_structured_response(get_category_data(category))
+
+    log_query_history(session['user_id'], f'[빠른 조회] {category}', result.get('type', 'text'), result.get('message', ''))
+    return jsonify(result)
 
 
 # ---------- 알림 조회/읽음 처리 ----------
