@@ -1,6 +1,7 @@
 import copy
 import csv
 import io
+import json
 import os
 import re
 import sqlite3
@@ -8,6 +9,7 @@ import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
@@ -97,13 +99,24 @@ def init_db():
         )
     ''')
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    ''')
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS query_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            conversation_id INTEGER,
             query TEXT NOT NULL,
             response_type TEXT NOT NULL,
             response_message TEXT NOT NULL,
-            is_favorite INTEGER NOT NULL DEFAULT 0,
+            response_data TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         )
     ''')
@@ -217,26 +230,79 @@ def get_notifications(department, role, unread_only=False):
     return [dict(row) for row in rows]
 
 
-# ---------- 조회 이력 / 즐겨찾기 ----------
-def log_query_history(user_id, query, response_type, response_message):
+# ---------- 대화 세션 (Claude/ChatGPT 스타일 대화 기록) ----------
+def create_conversation(user_id, title):
     conn = get_db()
-    conn.execute(
-        'INSERT INTO query_history (user_id, query, response_type, response_message) VALUES (?, ?, ?, ?)',
-        (user_id, query, response_type, response_message)
-    )
+    cur = conn.execute('INSERT INTO conversations (user_id, title) VALUES (?, ?)', (user_id, title[:60]))
+    conn.commit()
+    conversation_id = cur.lastrowid
+    conn.close()
+    return conversation_id
+
+
+def touch_conversation(conversation_id):
+    conn = get_db()
+    conn.execute("UPDATE conversations SET updated_at = datetime('now', 'localtime') WHERE id = ?", (conversation_id,))
     conn.commit()
     conn.close()
 
 
-def get_query_history(user_id, favorites_only=False):
+def get_conversations(user_id, limit=50):
     conn = get_db()
-    query = 'SELECT * FROM query_history WHERE user_id = ?'
-    if favorites_only:
-        query += ' AND is_favorite = 1'
-    query += ' ORDER BY created_at DESC LIMIT 100'
-    rows = conn.execute(query, (user_id,)).fetchall()
+    rows = conn.execute(
+        'SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?',
+        (user_id, limit)
+    ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_conversation_messages(conversation_id, user_id):
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM query_history WHERE conversation_id = ? AND user_id = ? ORDER BY id ASC',
+        (conversation_id, user_id)
+    ).fetchall()
+    conn.close()
+
+    messages = []
+    for row in rows:
+        item = dict(row)
+        if item.get('response_data'):
+            try:
+                item['response_data'] = json.loads(item['response_data'])
+            except ValueError:
+                item['response_data'] = None
+        messages.append(item)
+    return messages
+
+
+def get_last_domain_in_conversation(conversation_id, user_id):
+    if not conversation_id:
+        return None
+    conn = get_db()
+    row = conn.execute('''
+        SELECT response_type FROM query_history
+        WHERE conversation_id = ? AND user_id = ?
+        AND response_type IN ('financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr')
+        ORDER BY id DESC LIMIT 1
+    ''', (conversation_id, user_id)).fetchone()
+    conn.close()
+    return row['response_type'] if row else None
+
+
+def log_query_history(user_id, conversation_id, query, response_type, response_message, response_data=None):
+    conn = get_db()
+    conn.execute(
+        'INSERT INTO query_history (user_id, conversation_id, query, response_type, response_message, response_data) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (
+            user_id, conversation_id, query, response_type, response_message,
+            json.dumps(response_data, ensure_ascii=False) if response_data is not None else None
+        )
+    )
+    conn.commit()
+    conn.close()
 
 
 def login_required(f):
@@ -302,7 +368,7 @@ def call_potens_ai(prompt):
         POTENS_API_URL,
         json={'prompt': prompt, 'model': POTENS_MODEL},
         headers={'Authorization': f'Bearer {api_key}'},
-        timeout=15
+        timeout=45
     )
     response.raise_for_status()
     return response.json().get('message', '')
@@ -411,7 +477,7 @@ EXAMPLE_QUERIES_BY_CATEGORY = {
 }
 
 
-def generate_department_guide(department, allowed_categories):
+def build_department_guide(department, allowed_categories):
     if not allowed_categories:
         return None
 
@@ -425,6 +491,7 @@ def generate_department_guide(department, allowed_categories):
 
     lines.append('## 조회 가능한 데이터 및 예시 질문')
     lines.append('')
+    excel_rows = []
     for category in sorted(allowed_categories):
         # quality_cause는 별도 업무 영역이 아니라 '품질' 질문 중 원인분석 표현을 쓸 때
         # 자동으로 걸리는 하위 개념이라, 가이드에서는 품질 섹션 하나로 충분하다.
@@ -436,6 +503,7 @@ def generate_department_guide(department, allowed_categories):
         lines.append(heading)
         for q in EXAMPLE_QUERIES_BY_CATEGORY.get(category, []):
             lines.append(f'- "{q}"')
+            excel_rows.append({'분류': label, '관련메뉴': menu, '예시질문': q})
         lines.append('')
 
     manual_docs = [
@@ -449,10 +517,14 @@ def generate_department_guide(department, allowed_categories):
             lines.append(f"- {d['title']}")
         lines.append('')
 
+    return {'markdown': '\n'.join(lines), 'rows': excel_rows}
+
+
+def save_department_guide_to_knowledge(department, markdown_text):
     path = os.path.join(KNOWLEDGE_DIR, f'{department}_가이드.md')
     os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
+        f.write(markdown_text)
     return path
 
 
@@ -535,17 +607,29 @@ def index():
 @app.route('/api/query', methods=['POST'])
 @login_required
 def process_ai_query_route():
-    user_query = request.json.get('query', '')
+    payload = request.json or {}
+    user_query = payload.get('query', '')
+    conversation_id = payload.get('conversation_id')
+
     allowed = get_allowed_categories(session['department'], session['role'])
-    result = process_ai_query(user_query, allowed, session['department'])
+    last_domain = get_last_domain_in_conversation(conversation_id, session['user_id'])
+    result = process_ai_query(user_query, allowed, session['department'], last_domain)
 
     if user_query.strip():
-        log_query_history(session['user_id'], user_query, result.get('type', 'text'), result.get('message', ''))
+        if not conversation_id:
+            conversation_id = create_conversation(session['user_id'], user_query.strip())
+        else:
+            touch_conversation(conversation_id)
+        log_query_history(
+            session['user_id'], conversation_id, user_query,
+            result.get('type', 'text'), result.get('message', ''), result.get('data')
+        )
 
+    result['conversation_id'] = conversation_id
     return jsonify(result)
 
 
-def process_ai_query(user_query, allowed_categories=None, department=None):
+def process_ai_query(user_query, allowed_categories=None, department=None, last_domain=None):
     # 브라우저/IME에 따라 한글이 조합형(NFD)으로 넘어오면 '메출' 같은 문자열이
     # 우리 코드의 조합완성형(NFC) 키워드와 바이트 단위로 달라 매칭이 실패할 수 있다.
     # 항상 NFC로 정규화해서 비교한다.
@@ -562,9 +646,12 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
 
     stats_type = extract_stats_type(query)
     is_cause_analysis = contains_keyword(query, ['원인', '이유', '왜'])
-    # "어떻게 해야 돼", "무슨 절차야" 같은 절차 질문은 RAG 문서를 근거로 답할 때
-    # 산문이 아니라 번호 매긴 체크리스트로 정리해서 답하도록 유도한다.
-    is_procedural = contains_keyword(query, ['어떻게', '방법', '절차', '체크리스트', '준비물', '하려면', '순서'])
+    # "어떻게 해야 돼", "지금 뭘 확인해야 돼", "우선순위대로 정리해줘" 같은 질문은
+    # 결과를 산문이 아니라 번호 매긴 체크리스트로 정리해서 답하도록 유도한다.
+    # (RAG 문서 기반이면 절차 안내로, ERP 데이터 기반이면 이슈 우선순위 체크리스트로 쓰인다)
+    is_checklist_request = contains_keyword(
+        query, ['어떻게', '방법', '절차', '체크리스트', '준비물', '하려면', '순서', '확인해야', '확인할', '우선순위']
+    )
 
     result = None
 
@@ -580,6 +667,12 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
         result = handle_hr_query(query, period, is_comparison, specific_item, stats_type)
     elif contains_keyword(query, ['전체', '모든', '종합']):
         result = handle_comprehensive_query(query, allowed_categories)
+    elif is_checklist_request and last_domain:
+        # "얘네 지금 뭐부터 확인해야 돼?" 처럼 도메인 키워드 없이 직전 대화의
+        # 주제(last_domain)를 이어받아 체크리스트를 요청하는 경우.
+        domain_data = get_domain_data(last_domain)
+        if domain_data is not None:
+            result = {'type': last_domain, 'data': domain_data, 'message': '', 'query': query}
 
     if result:
         if allowed_categories is not None and result.get('type') not in allowed_categories:
@@ -588,6 +681,15 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
                 'data': None,
                 'message': '🔒 소속 부서 권한으로는 조회할 수 없는 데이터입니다. 담당 부서 또는 관리자에게 문의해주세요.'
             }
+
+        # ERP 데이터를 근거로 지금 확인/조치해야 할 사항을 우선순위 체크리스트로 정리
+        if is_checklist_request and result.get('type') in ('financial', 'production', 'purchase', 'quality', 'quality_cause', 'hr'):
+            checklist = generate_issue_checklist(result['type'], result.get('data'))
+            if checklist:
+                result['message'] = checklist
+            elif not result['message']:
+                result['message'] = f"{DOMAIN_LABELS.get(result['type'], result['type'])} 현황을 조회했습니다."
+
         return enrich_structured_response(result)
 
     # 정형 카테고리 키워드에 걸리지 않은 질문은 사내 문서(RAG)에서 근거를 찾은 경우에만
@@ -599,7 +701,7 @@ def process_ai_query(user_query, allowed_categories=None, department=None):
             context_text = '\n\n'.join(
                 f"[{doc['title']}]\n{doc['content']}" for doc in knowledge_hits
             )
-            if is_procedural:
+            if is_checklist_request:
                 instruction = (
                     '다음은 사내 규정/매뉴얼 문서입니다. 이 내용을 근거로, 사용자가 지금 처리해야 할 업무를 '
                     '번호를 매긴 체크리스트 형태로(1. 2. 3. ...) 정리해서 답변하세요. 각 단계는 한 줄로 '
@@ -1274,7 +1376,49 @@ def handle_hr_query(query, period, is_comparison, specific_item, stats_type):
 
 
 # ---------- 종합 질문 처리 ----------
-DOMAIN_LABELS = {'financial': '재무', 'production': '생산', 'purchase': '구매', 'quality': '품질', 'hr': '인사'}
+DOMAIN_LABELS = {
+    'financial': '재무', 'production': '생산', 'purchase': '구매',
+    'quality': '품질', 'quality_cause': '품질(원인분석)', 'hr': '인사'
+}
+
+
+def get_domain_data(domain_type):
+    if domain_type == 'financial':
+        return get_financial_data()
+    if domain_type == 'production':
+        return get_production_data()
+    if domain_type == 'purchase':
+        return get_purchase_data()
+    if domain_type in ('quality', 'quality_cause'):
+        return get_quality_data()
+    if domain_type == 'hr':
+        return get_hr_data()
+    return None
+
+
+# ---------- ERP 데이터 기반 이슈 체크리스트 ----------
+# RAG는 "사내 규정 문서"를 근거로 답하는 반면, 이건 실제 조회한 ERP 수치를
+# 근거로 "지금 우선적으로 확인/조치해야 할 것"을 AI가 정리하도록 한다.
+def generate_issue_checklist(domain_type, data):
+    if not data:
+        return None
+    label = DOMAIN_LABELS.get(domain_type, domain_type)
+    # 일별 원시 로그(daily/inspections/attendance)는 체크리스트 판단에 크게
+    # 안 쓰이면서 프롬프트만 길어지게 하므로 제외해 응답 속도를 개선한다.
+    trimmed = {k: v for k, v in data.items() if k not in ('daily', 'inspections', 'attendance')}
+    data_text = json.dumps(trimmed, ensure_ascii=False, indent=2)
+    prompt = (
+        f'다음은 사내 ERP {label} 데이터입니다. 이 데이터를 분석해서 담당자가 지금 우선적으로 '
+        '확인하거나 조치해야 할 사항을 중요도 순으로 번호를 매긴 체크리스트로 정리하세요. '
+        '각 항목은 데이터의 구체적인 수치를 근거로 제시하고, 왜 우선순위가 높은지 한 줄로 '
+        '설명하세요. 데이터에 없는 내용은 추측하지 마세요.\n\n'
+        f'[{label} 데이터]\n{data_text}'
+    )
+    try:
+        return call_potens_ai(prompt)
+    except Exception as e:
+        print(f'이슈 체크리스트 생성 실패: {e}')
+        return None
 
 
 def handle_comprehensive_query(query, allowed_categories=None):
@@ -1447,7 +1591,18 @@ def get_category_data_route(category):
         # (사이드바 '빠른 조회' 버튼과 채팅 질의가 서로 다른 응답을 주지 않도록 통일).
         result = enrich_structured_response(get_category_data(category))
 
-    log_query_history(session['user_id'], f'[빠른 조회] {category}', result.get('type', 'text'), result.get('message', ''))
+    conversation_id = request.args.get('conversation_id', type=int)
+    label = DOMAIN_LABELS.get(category, category)
+    if not conversation_id:
+        conversation_id = create_conversation(session['user_id'], f'[빠른 조회] {label}')
+    else:
+        touch_conversation(conversation_id)
+
+    log_query_history(
+        session['user_id'], conversation_id, f'[빠른 조회] {label}',
+        result.get('type', 'text'), result.get('message', ''), result.get('data')
+    )
+    result['conversation_id'] = conversation_id
     return jsonify(result)
 
 
@@ -1478,29 +1633,33 @@ def mark_notification_read_route(notification_id):
     return jsonify({'ok': True})
 
 
-# ---------- 조회 이력 / 즐겨찾기 라우트 ----------
-@app.route('/api/history', methods=['GET'])
+# ---------- 대화 세션 라우트 ----------
+@app.route('/api/conversations', methods=['GET'])
 @login_required
-def history_route():
-    favorites_only = request.args.get('favorites') == '1'
-    items = get_query_history(session['user_id'], favorites_only)
-    return jsonify({'history': items})
+def conversations_route():
+    return jsonify({'conversations': get_conversations(session['user_id'])})
 
 
-@app.route('/api/history/<int:history_id>/favorite', methods=['POST'])
+@app.route('/api/conversations/<int:conversation_id>/messages', methods=['GET'])
 @login_required
-def toggle_favorite_route(history_id):
+def conversation_messages_route(conversation_id):
+    return jsonify({'messages': get_conversation_messages(conversation_id, session['user_id'])})
+
+
+@app.route('/api/conversations/<int:conversation_id>/favorite', methods=['POST'])
+@login_required
+def toggle_conversation_favorite_route(conversation_id):
     conn = get_db()
     row = conn.execute(
-        'SELECT is_favorite FROM query_history WHERE id = ? AND user_id = ?',
-        (history_id, session['user_id'])
+        'SELECT is_favorite FROM conversations WHERE id = ? AND user_id = ?',
+        (conversation_id, session['user_id'])
     ).fetchone()
     if not row:
         conn.close()
-        return jsonify({'error': '이력을 찾을 수 없습니다.'}), 404
+        return jsonify({'error': '대화를 찾을 수 없습니다.'}), 404
 
     new_value = 0 if row['is_favorite'] else 1
-    conn.execute('UPDATE query_history SET is_favorite = ? WHERE id = ?', (new_value, history_id))
+    conn.execute('UPDATE conversations SET is_favorite = ? WHERE id = ?', (new_value, conversation_id))
     conn.commit()
     conn.close()
     return jsonify({'ok': True, 'is_favorite': bool(new_value)})
@@ -1523,10 +1682,26 @@ def generate_faq_route():
 def generate_department_guide_route():
     department = session['department']
     allowed = get_allowed_categories(department, session['role'])
-    path = generate_department_guide(department, allowed)
-    if not path:
+    guide = build_department_guide(department, allowed)
+    if not guide:
         return jsonify({'ok': False, 'message': '조회 권한이 없어 가이드를 생성할 수 없습니다.'})
-    return jsonify({'ok': True, 'message': f'{department} ERP 가이드를 생성해 사내 지식 문서(knowledge)에 반영했습니다.'})
+    save_department_guide_to_knowledge(department, guide['markdown'])
+    return jsonify({'ok': True, 'department': department, 'content': guide['markdown']})
+
+
+@app.route('/api/generate-department-guide/excel', methods=['POST'])
+@login_required
+def generate_department_guide_excel_route():
+    department = session['department']
+    allowed = get_allowed_categories(department, session['role'])
+    guide = build_department_guide(department, allowed)
+    if not guide or not guide['rows']:
+        return jsonify({'error': '내보낼 가이드 내용이 없습니다.'}), 400
+    save_department_guide_to_knowledge(department, guide['markdown'])
+    return build_excel_response(
+        'department_guide', ['분류', '관련메뉴', '예시질문'], guide['rows'],
+        filename=f'{department}_ERP가이드.xlsx'
+    )
 
 
 # ---------- 응답 CSV 내보내기 ----------
@@ -1551,6 +1726,14 @@ def extract_export_rows(export_type, data):
     return None, None
 
 
+def content_disposition_header(filename):
+    # HTTP 헤더 값은 latin-1만 허용되어 한글 파일명을 그대로 넣으면 응답 자체가
+    # 깨진다(서버가 응답을 못 보내고 클라이언트가 무한정 기다리게 됨). ASCII
+    # 대체 파일명 + RFC 5987 형식의 UTF-8 파일명을 함께 내려준다.
+    ascii_fallback = filename.encode('ascii', 'ignore').decode('ascii').strip() or 'download'
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 EXPORT_SHEET_TITLES = {
     'financial': '재무',
     'production': '생산',
@@ -1561,7 +1744,7 @@ EXPORT_SHEET_TITLES = {
 }
 
 
-def build_excel_response(export_type, fieldnames, rows):
+def build_excel_response(export_type, fieldnames, rows, filename=None):
     wb = Workbook()
     ws = wb.active
     ws.title = (EXPORT_SHEET_TITLES.get(export_type, export_type) or export_type)[:31]
@@ -1585,10 +1768,11 @@ def build_excel_response(export_type, fieldnames, rows):
     wb.save(buffer)
     buffer.seek(0)
 
+    final_filename = filename or f'erp_export_{export_type}.xlsx'
     return Response(
         buffer.read(),
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        headers={'Content-Disposition': f'attachment; filename=erp_export_{export_type}.xlsx'}
+        headers={'Content-Disposition': content_disposition_header(final_filename)}
     )
 
 
@@ -1617,7 +1801,7 @@ def export_route():
     return Response(
         csv_bytes,
         mimetype='text/csv',
-        headers={'Content-Disposition': f'attachment; filename=erp_export_{export_type}.csv'}
+        headers={'Content-Disposition': content_disposition_header(f'erp_export_{export_type}.csv')}
     )
 
 
@@ -1638,4 +1822,6 @@ def get_category_data(category):
 init_db()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=int(os.environ.get('PORT', 5000)))
+    # threaded=True 필수: 기본(싱글 스레드) 상태에서는 한 사용자가 AI 응답을
+    # 기다리는 동안 다른 모든 사용자의 요청이 전부 멈춰버린다.
+    app.run(debug=True, port=int(os.environ.get('PORT', 5000)), threaded=True)

@@ -358,9 +358,9 @@
         </div>
 
         <div class="sidebar-section">
-          <div class="sidebar-section-title">대화 기록</div>
+          <div class="sidebar-section-title">대화</div>
           <div id="historyList">
-            <div class="sidebar-empty">아직 조회 이력이 없습니다.</div>
+            <div class="sidebar-empty">아직 대화 기록이 없습니다.</div>
           </div>
         </div>
       </div>
@@ -380,7 +380,13 @@
           <div class="popover" id="notifPanel"></div>
         </div>
 
-        <button class="ghost-row" onclick="generateDepartmentGuide()" type="button">📘 우리 부서 가이드 생성</button>
+        <div style="position: relative;">
+          <button class="ghost-row" id="guideToggle" onclick="toggleGuideMenu()" type="button">📘 우리 부서 가이드</button>
+          <div class="popover" id="guideMenu">
+            <div class="popover-item" style="cursor:pointer;" onclick="downloadDepartmentGuideExcel()">📊 엑셀로 받기</div>
+            <div class="popover-item" style="cursor:pointer;" onclick="downloadDepartmentGuidePDF()">📄 PDF로 받기</div>
+          </div>
+        </div>
 
         {% if role == 'admin' %}
         <button class="ghost-row" onclick="generateFaq()" type="button">📚 FAQ 자동생성</button>
@@ -487,12 +493,15 @@
       sidebarCollapseBtn.addEventListener('click', closeSidebar);
 
       /* ---------- New chat ---------- */
+      var currentConversationId = null;
       newChatBtn.addEventListener('click', function () {
         messagesEl.innerHTML = '';
         emptyState.style.display = 'flex';
         composerInput.value = '';
+        currentConversationId = null;
         autoGrow();
         closeSidebar();
+        renderConversations(lastConversations);
       });
 
       /* ---------- Composer ---------- */
@@ -620,13 +629,14 @@
         fetch('/api/query', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: text })
+          body: JSON.stringify({ query: text, conversation_id: currentConversationId })
         })
           .then(function (res) { return res.json(); })
           .then(function (response) {
             removeTypingIndicator();
             appendAssistantMessage(response);
-            fetchHistory();
+            currentConversationId = response.conversation_id || currentConversationId;
+            fetchConversations();
           })
           .catch(function () {
             removeTypingIndicator();
@@ -637,11 +647,14 @@
       window.loadCategory = function (category) {
         emptyState.style.display = 'none';
         appendTypingIndicator();
-        fetch('/api/category/' + category)
+        var qs = currentConversationId ? ('?conversation_id=' + currentConversationId) : '';
+        fetch('/api/category/' + category + qs)
           .then(function (res) { return res.json(); })
           .then(function (response) {
             removeTypingIndicator();
             appendAssistantMessage(response);
+            currentConversationId = response.conversation_id || currentConversationId;
+            fetchConversations();
           })
           .catch(function () {
             removeTypingIndicator();
@@ -686,18 +699,15 @@
       // PDF: 서버 없이 브라우저에 이미 렌더링된 결과 화면을 캡처해서 PDF로 만든다.
       // (서버에서 PDF를 만들면 한글 폰트를 따로 심어야 해서 깨지기 쉬움 — 이미 화면에
       // 정상적으로 그려진 한글을 이미지로 캡처하는 방식이 훨씬 안전하다.)
-      window.exportPDF = function (uid, btn) {
-        var response = msgDataRegistry[uid];
-        var slot = document.getElementById(uid + '-slot');
-        if (!response || !slot || !window.html2canvas || !window.jspdf) {
-          alert('PDF 생성에 필요한 라이브러리를 불러오지 못했습니다.');
-          return;
+      // 화면에 렌더링된 엘리먼트를 캡처해서 PDF로 저장 (여러 곳에서 재사용:
+      // 채팅 메시지 내보내기, 부서 가이드 PDF 등). A4 한 페이지를 넘으면 자동 분할.
+      function elementToPdf(el, filename) {
+        if (!window.html2canvas || !window.jspdf) {
+          return Promise.reject(new Error('PDF 라이브러리를 불러오지 못했습니다.'));
         }
-        btn.disabled = true;
         var bg = getComputedStyle(document.body).getPropertyValue('--bg-panel').trim() || '#ffffff';
 
-        html2canvas(slot, { backgroundColor: bg, scale: 2 }).then(function (canvas) {
-          var imgData = canvas.toDataURL('image/png');
+        return html2canvas(el, { backgroundColor: bg, scale: 2 }).then(function (canvas) {
           var pdf = new window.jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
           var pageWidth = pdf.internal.pageSize.getWidth();
           var pageHeight = pdf.internal.pageSize.getHeight();
@@ -705,11 +715,10 @@
           var imgWidth = pageWidth - margin * 2;
           var imgHeight = canvas.height * imgWidth / canvas.width;
 
-          var y = margin;
           var remainingHeight = imgHeight;
           var sourceY = 0;
+          var isFirstPage = true;
 
-          // 결과가 A4 한 페이지보다 길면 여러 페이지로 나눠서 이어 붙인다.
           while (remainingHeight > 0) {
             var sliceHeightPt = Math.min(pageHeight - margin * 2, remainingHeight);
             var sliceHeightPx = sliceHeightPt * canvas.width / imgWidth;
@@ -722,19 +731,26 @@
             ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
             ctx.drawImage(canvas, 0, sourceY, canvas.width, sliceHeightPx, 0, 0, canvas.width, sliceHeightPx);
 
-            if (y !== margin) pdf.addPage();
+            if (!isFirstPage) pdf.addPage();
+            isFirstPage = false;
             pdf.addImage(pageCanvas.toDataURL('image/png'), 'PNG', margin, margin, imgWidth, sliceHeightPt);
 
             sourceY += sliceHeightPx;
             remainingHeight -= sliceHeightPt;
           }
 
-          pdf.save('erp_export_' + response.type + '.pdf');
-        }).catch(function () {
-          alert('PDF 내보내기에 실패했습니다.');
-        }).finally(function () {
-          btn.disabled = false;
+          pdf.save(filename);
         });
+      }
+
+      window.exportPDF = function (uid, btn) {
+        var response = msgDataRegistry[uid];
+        var slot = document.getElementById(uid + '-slot');
+        if (!response || !slot) return;
+        btn.disabled = true;
+        elementToPdf(slot, 'erp_export_' + response.type + '.pdf')
+          .catch(function () { alert('PDF 내보내기에 실패했습니다.'); })
+          .finally(function () { btn.disabled = false; });
       };
 
       /* ---------- 알림 ---------- */
@@ -747,12 +763,19 @@
         if (!isOpen) fetchNotifications();
       };
 
-      // 알림 패널/내보내기 메뉴 바깥을 클릭하면 자동으로 닫는다.
+      // 알림/가이드 패널, 내보내기 메뉴 바깥을 클릭하면 자동으로 닫는다.
+      var guideToggleBtn = document.getElementById('guideToggle');
       document.addEventListener('click', function (e) {
         var notifPanel = document.getElementById('notifPanel');
         if (notifPanel && notifPanel.classList.contains('show') &&
             !notifPanel.contains(e.target) && e.target !== notifToggleBtn && !notifToggleBtn.contains(e.target)) {
           notifPanel.classList.remove('show');
+        }
+
+        var guideMenu = document.getElementById('guideMenu');
+        if (guideMenu && guideMenu.classList.contains('show') &&
+            !guideMenu.contains(e.target) && e.target !== guideToggleBtn && !guideToggleBtn.contains(e.target)) {
+          guideMenu.classList.remove('show');
         }
 
         document.querySelectorAll('.export-format-menu.show').forEach(function (menu) {
@@ -811,41 +834,59 @@
       fetchNotifications();
       setInterval(fetchNotifications, 60000);
 
-      /* ---------- 조회 이력 / 즐겨찾기 ---------- */
-      function fetchHistory() {
-        fetch('/api/history')
+      /* ---------- 대화 세션 (Claude/ChatGPT 스타일) ---------- */
+      var lastConversations = [];
+
+      function fetchConversations() {
+        fetch('/api/conversations')
           .then(function (res) { return res.json(); })
-          .then(function (data) { renderHistory(data.history || []); })
+          .then(function (data) {
+            lastConversations = data.conversations || [];
+            renderConversations(lastConversations);
+          })
           .catch(function () {});
       }
 
-      function renderHistory(items) {
+      function renderConversations(items) {
         var list = document.getElementById('historyList');
         if (items.length === 0) {
-          list.innerHTML = '<div class="sidebar-empty">아직 조회 이력이 없습니다.</div>';
+          list.innerHTML = '<div class="sidebar-empty">아직 대화 기록이 없습니다.</div>';
           return;
         }
-        list.innerHTML = items.slice(0, 15).map(function (h) {
-          return '<div class="history-item">' +
-            '<span class="history-q" title="' + escapeHtml(h.query) + '" onclick="rerunQuery(' + JSON.stringify(h.query) + ')">' + escapeHtml(h.query) + '</span>' +
-            '<span class="fav-star ' + (h.is_favorite ? 'active' : '') + '" onclick="toggleFavorite(' + h.id + ', event)">' + (h.is_favorite ? '⭐' : '☆') + '</span>' +
+        list.innerHTML = items.slice(0, 30).map(function (c) {
+          var activeStyle = c.id === currentConversationId ? 'background:var(--bg-hover);' : '';
+          return '<div class="history-item" style="' + activeStyle + '">' +
+            '<span class="history-q" title="' + escapeHtml(c.title) + '" onclick="loadConversation(' + c.id + ')">' + escapeHtml(c.title) + '</span>' +
+            '<span class="fav-star ' + (c.is_favorite ? 'active' : '') + '" onclick="toggleConversationFavorite(' + c.id + ', event)">' + (c.is_favorite ? '⭐' : '☆') + '</span>' +
             '</div>';
         }).join('');
       }
 
-      window.rerunQuery = function (query) {
-        composerInput.value = query;
-        autoGrow();
-        sendMessage();
-        closeSidebar();
+      // 저장된 대화를 클릭하면 그 대화의 전체 턴을 다시 그려서 이어서 대화할 수 있게 한다.
+      window.loadConversation = function (id) {
+        fetch('/api/conversations/' + id + '/messages')
+          .then(function (res) { return res.json(); })
+          .then(function (data) {
+            messagesEl.innerHTML = '';
+            emptyState.style.display = 'none';
+            currentConversationId = id;
+            (data.messages || []).forEach(function (m) {
+              appendUserMessage(m.query);
+              appendAssistantMessage({ type: m.response_type, message: m.response_message, data: m.response_data });
+            });
+            scrollToBottom();
+            renderConversations(lastConversations);
+            closeSidebar();
+          })
+          .catch(function () { alert('대화를 불러오지 못했습니다.'); });
       };
 
-      window.toggleFavorite = function (id, event) {
+      window.toggleConversationFavorite = function (id, event) {
         event.stopPropagation();
-        fetch('/api/history/' + id + '/favorite', { method: 'POST' }).then(fetchHistory);
+        fetch('/api/conversations/' + id + '/favorite', { method: 'POST' }).then(fetchConversations);
       };
 
-      fetchHistory();
+      fetchConversations();
 
       /* ---------- FAQ 자동생성 (관리자) ---------- */
       window.generateFaq = function () {
@@ -855,11 +896,37 @@
           .catch(function () { alert('FAQ 생성에 실패했습니다.'); });
       };
 
-      /* ---------- 부서별 ERP 가이드 자동생성 ---------- */
-      window.generateDepartmentGuide = function () {
+      /* ---------- 부서별 ERP 가이드 (엑셀/PDF 다운로드) ---------- */
+      window.toggleGuideMenu = function () {
+        var menu = document.getElementById('guideMenu');
+        if (menu) menu.classList.toggle('show');
+      };
+
+      window.downloadDepartmentGuideExcel = function () {
+        fetch('/api/generate-department-guide/excel', { method: 'POST' })
+          .then(function (res) {
+            if (!res.ok) return res.json().then(function (d) { throw new Error(d.error || '실패'); });
+            return res.blob();
+          })
+          .then(function (blob) { downloadBlob(blob, 'erp_department_guide.xlsx'); })
+          .catch(function (err) { alert(err.message || '엑셀 생성에 실패했습니다.'); });
+      };
+
+      window.downloadDepartmentGuidePDF = function () {
         fetch('/api/generate-department-guide', { method: 'POST' })
           .then(function (res) { return res.json(); })
-          .then(function (data) { alert(data.message); })
+          .then(function (data) {
+            if (!data.ok) { alert(data.message); return; }
+            var hidden = document.createElement('div');
+            hidden.className = 'msg-text';
+            hidden.style.cssText = 'position:fixed; left:-9999px; top:0; width:700px; padding:24px; background:var(--bg-panel); color:var(--text);';
+            hidden.innerHTML = renderMarkdown(data.content);
+            document.body.appendChild(hidden);
+
+            elementToPdf(hidden, (data.department || 'ERP') + '_가이드.pdf')
+              .catch(function () { alert('PDF 생성에 실패했습니다.'); })
+              .finally(function () { hidden.remove(); });
+          })
           .catch(function () { alert('가이드 생성에 실패했습니다.'); });
       };
 
